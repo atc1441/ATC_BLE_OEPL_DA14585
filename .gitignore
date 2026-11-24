@@ -1,0 +1,11 @@
+# The toolchain tools/setup.py downloads, and the build it produces.
+/tools/gcc-arm-none-eabi/
+/build/
+
+# The SDK is committed. sdk_root.txt is the local override that points the
+# build at another copy, so it is one machine's path and stays out.
+sdk_root.txt
+
+__pycache__/
+*.pyc
+.venv/

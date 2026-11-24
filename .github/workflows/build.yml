@@ -1,0 +1,103 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: protocol, settings and panel catalog
+        run: python3 tools/test.py
+
+  firmware:
+    name: firmware
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+
+      # Everything the build needs is in the tree: the SDK is in sdk/, and the
+      # only thing fetched is the compiler, pinned by SHA-256 and cached.
+      - name: Cache the ARM toolchain
+        uses: actions/cache@v4
+        with:
+          path: tools/gcc-arm-none-eabi
+          key: xpack-arm-none-eabi-gcc-10.3.1-2.3-linux-x64
+
+      - name: ARM toolchain
+        run: python3 tools/setup.py
+
+      - name: Build
+        run: python3 tools/build.py
+
+      - name: Collect
+        id: image
+        run: |
+          set -eu
+          mkdir -p dist
+          case "$GITHUB_REF" in
+            refs/tags/*) label="${GITHUB_REF#refs/tags/}" ;;
+            *)           label="$(git rev-parse --short HEAD)" ;;
+          esac
+          cp build/atc_oepl.bin "dist/ATC_BLE_OEPL_DA14585_${label}.bin"
+          cp build/atc_oepl.elf "dist/ATC_BLE_OEPL_DA14585_${label}.elf"
+          cp build/atc_oepl.map "dist/ATC_BLE_OEPL_DA14585_${label}.map"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import struct, pathlib
+          b = pathlib.Path("build/atc_oepl.bin").read_bytes()
+          sig, length, crc = struct.unpack_from("<4sII", b, 0)
+          assert sig == bytes([0x70, 0x51, 0xAA, 0x00]), sig
+          assert b[12:20] == b"ATC_OEPL", b[12:20]
+          assert len(b) == length + 64, (len(b), length)
+          print("size=%d" % len(b))
+          print("crc=%08X" % crc)
+          PY
+          echo "firmware ${label}: $(stat -c%s build/atc_oepl.bin) bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATC_BLE_OEPL_DA14585_${{ steps.image.outputs.label }}
+          path: dist/*
+          if-no-files-found: error
+
+      # A tag makes a release of its own. A push to the default branch keeps a
+      # single rolling "latest" pre-release up to date, so there is always one
+      # link to the firmware that is in the tree right now.
+      - name: Release
+        if: >
+          github.event_name == 'push' &&
+          (startsWith(github.ref, 'refs/tags/v') ||
+           github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ steps.image.outputs.label }}
+          SIZE: ${{ steps.image.outputs.size }}
+          CRC: ${{ steps.image.outputs.crc }}
+        run: |
+          set -eu
+          notes="$(printf '%s\n\n%s\n' \
+            "Firmware image for the DA14585 ATC_BLE_OEPL tag: ${SIZE} bytes, CRC ${CRC}, built from ${GITHUB_SHA}." \
+            "Send the .bin with the web uploader or an OpenEPaperLink access point, or write it to flash with \`python tools/flash.py\`.")"
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            gh release create "$LABEL" --title "$LABEL" --notes "$notes" dist/*
+          else
+            gh release delete latest --yes --cleanup-tag || true
+            gh release create latest --target "$GITHUB_SHA" --prerelease \
+              --title "Latest build (${LABEL})" --notes "$notes" dist/*
+          fi

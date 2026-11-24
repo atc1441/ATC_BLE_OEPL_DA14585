@@ -1,0 +1,8 @@
+# Path to a Dialog / Renesas DA14585 SDK 6.0.22.1401 tree.
+# Absolute, or relative to the root of this repository.
+# The SDK is not part of this repository and may not be redistributed.
+#
+# Either copy this file to sdk_root.txt and edit the line below, or let
+#   python tools/setup.py --sdk <directory or archive>
+# write it for you.
+C:/path/to/DA145xx_SDK/6.0.22.1401

@@ -1,0 +1,12 @@
+* text=auto
+*.bin binary
+*.elf binary
+*.a binary
+*.exe binary
+*.o binary
+*.obj binary
+*.dll binary
+*.lib binary
+
+# The SDK is committed exactly as Renesas shipped it: no line-ending work.
+/sdk/** -text

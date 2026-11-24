@@ -1,0 +1,2 @@
+# Used by tools/flash.py. The build itself needs only Python 3.
+pylink-square
