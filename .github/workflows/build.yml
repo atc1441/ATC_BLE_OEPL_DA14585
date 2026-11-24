@@ -53,9 +53,13 @@ jobs:
             refs/tags/*) label="${GITHUB_REF#refs/tags/}" ;;
             *)           label="$(git rev-parse --short HEAD)" ;;
           esac
-          cp build/atc_oepl.bin "dist/ATC_BLE_OEPL_DA14585_${label}.bin"
-          cp build/atc_oepl.elf "dist/ATC_BLE_OEPL_DA14585_${label}.elf"
-          cp build/atc_oepl.map "dist/ATC_BLE_OEPL_DA14585_${label}.map"
+          # One fixed, short name. An OpenEPaperLink access point lists the
+          # .bin files it can send by name and its name field is short, so
+          # the version cannot ride in the file name - it is in the release
+          # title, the notes and the image's own header.
+          cp build/atc_oepl.bin dist/ATC_OEPL_DA14585.bin
+          cp build/atc_oepl.elf dist/ATC_OEPL_DA14585.elf
+          cp build/atc_oepl.map dist/ATC_OEPL_DA14585.map
           echo "label=$label" >> "$GITHUB_OUTPUT"
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import struct, pathlib
@@ -72,12 +76,12 @@ jobs:
       - name: Upload build output
         uses: actions/upload-artifact@v4
         with:
-          name: ATC_BLE_OEPL_DA14585_${{ steps.image.outputs.label }}
+          name: ATC_OEPL_DA14585_${{ steps.image.outputs.label }}
           path: dist/*
           if-no-files-found: error
 
       # A tag makes a release of its own. A push to the default branch keeps a
-      # single rolling "latest" pre-release up to date, so there is always one
+      # single rolling "latest" release up to date, so there is always one
       # link to the firmware that is in the tree right now.
       - name: Release
         if: >
@@ -98,6 +102,6 @@ jobs:
             gh release create "$LABEL" --title "$LABEL" --notes "$notes" dist/*
           else
             gh release delete latest --yes --cleanup-tag || true
-            gh release create latest --target "$GITHUB_SHA" --prerelease \
+            gh release create latest --target "$GITHUB_SHA" --latest \
               --title "Latest build (${LABEL})" --notes "$notes" dist/*
           fi

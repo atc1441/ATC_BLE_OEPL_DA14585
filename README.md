@@ -15,7 +15,7 @@ including the SDK.
 | Service / characteristic | `0x1337` (both), on the Bluetooth base UUID |
 | Firmware version | `0x0030` (48) |
 | Boards | One config per PCB: which glass, and whether the LED and NFC are fitted. Config `1` is the 7.5″ 880 × 528 black/white/red |
-| Firmware file | `firmware/ATC_BLE_OEPL_DA14585.bin`, 61 640 bytes |
+| Firmware file | `firmware/ATC_OEPL_DA14585.bin`, 61 640 bytes |
 | License | **GPL-3.0-or-later**; the bundled SDK keeps its own terms |
 
 ---
@@ -43,7 +43,7 @@ requirements.txt` for `pylink-square`.
 python tools/flash.py --serial <j-link serial number>
 ```
 
-It writes `firmware/ATC_BLE_OEPL_DA14585.bin` after `python tools/build.py` has made
+It writes `firmware/ATC_OEPL_DA14585.bin` after `python tools/build.py` has made
 it, or pass `--image-only` to rebuild the file from an existing payload without
 opening a probe. There is no default probe; the serial number is the one J-Link
 Commander prints.
@@ -147,9 +147,16 @@ test takes a second. Warnings are errors there.
 ## Releases
 
 `.github/workflows/build.yml` runs on every push: the host tests, then the firmware.
-A push to the default branch refreshes a rolling **`latest`** pre-release; a `v*` tag
-makes a release of its own. Both carry the firmware named after the tag or the short
-commit, plus the `.elf` and `.map`.
+A push to the default branch refreshes a rolling **`latest`** release; a `v*` tag
+makes a release of its own. Both carry the same three files:
+
+| Asset | |
+| --- | --- |
+| `ATC_OEPL_DA14585.bin` | The firmware. Short name, no version in it: an access point lists the files it can send by name and its name field is short, so the version lives in the release title, the notes and the image's own header |
+| `ATC_OEPL_DA14585.elf`, `.map` | For chasing a symbol or a size |
+
+`firmware/ATC_OEPL_DA14585.bin` in the tree is the same file, ready to flash without
+building anything.
 
 Nothing has to be configured: the SDK is in the tree and the only thing the runner
 fetches is the compiler, pinned and cached, so a build takes about a minute. A fork
