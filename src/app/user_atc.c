@@ -117,7 +117,7 @@ static uint16_t atc_capabilities(void)
 /* Little-endian on the air: bytes 0x31, 0x00. Decimal 49. The access point
  * turns on zlib images once a tag reports a version of 0x27 or higher.
  */
-#define ATC_FW_VERSION    0x0039u
+#define ATC_FW_VERSION    0x003Au
 
 extern struct bd_addr dev_bdaddr;
 

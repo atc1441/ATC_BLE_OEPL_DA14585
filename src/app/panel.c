@@ -29,6 +29,7 @@ static const atc_panel catalog[] = {
     {   0u, 0x00FAu,   0u,   0u, 0u, ATC_DRV_NONE,   0u,                        0x00u, "unconfigured"       },
     {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED,               0x40u, "7.5 BWR ZKC75S"     },
     {   2u, 0x0074u, 960u, 680u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "13.3 BWR ZKC133V-N" },
+    {   3u, 0x0072u, 960u, 640u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "11.6 BWR ZKC"       },
 };
 
 /* Row 2, the 13.3 inch board, read off its own stock firmware:
@@ -49,6 +50,27 @@ static const atc_panel catalog[] = {
  *   - Its flash is 2 MiB (JEDEC A1 28 15) rather than 512 KiB, which is why
  *     the window sits at 0x140000: clear of everything the stock layout uses,
  *     and big enough for two planes with room to spare.
+ */
+
+/* Row 3, the 11.6 inch board, read off its own stock firmware (dumped from
+ * J-Link 801, 2 MiB, JEDEC A1 28 15):
+ *
+ *   - 960 by 640, two 1-bit planes. The width and height are in the panel
+ *     descriptor at 0x4000A of its flash (0x8100, then 960, then the height,
+ *     then a 0x07FC.. pointer); the 13.3 inch board has 960 by 680 at the
+ *     same offset. 960 wide, so it fits this driver's 1024-pixel row and the
+ *     same picture window the 13.3 inch glass uses.
+ *   - Same ZKC / SSD1677 controller and the same init this driver sends. The
+ *     firmware carries both booster sequences - 0xAE 0xC7 0xC3 0xC0 then 0x40,
+ *     and the same then 0x80 - and the 960-wide glass takes the 0x80 one, as
+ *     the 13.3 inch board does; the 0x40 sequence is the narrower 7.5 inch
+ *     path. Hence boost 0x80.
+ *   - Hardware type 0x72, which is resources/tagtypes/72.json in the access
+ *     point already (960 x 640, "11.6 BWR") - no new tag type is needed.
+ *   - caps is ATC_CAP_NFC: this board has the NFC chip and no RGB LED
+ *     (confirmed by its owner).
+ *   - This board's own address is A0:A3:B8:89:79:70, its OTP key is in
+ *     notes/otp (otp_11in_801.bin).
  */
 
 /* The row chosen for this run. Null means row 0, unconfigured, which is
