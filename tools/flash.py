@@ -144,6 +144,33 @@ def build_image():
     return image
 
 
+def probe_speed():
+    """SWD clock in kHz. 4 MHz on a short lead; drop it if a flash fails."""
+    if "--speed" in sys.argv:
+        index = sys.argv.index("--speed")
+        if index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1], 0)
+    return 4000
+
+
+def write_bytes(jlink, addr, data):
+    """Word writes, not byte writes.
+
+    pylink's memory_write8 puts one byte per SWD access, and a 256-byte page
+    that way took well over a second: programming a 61 KiB image ran for six
+    minutes. The same bytes as 32-bit words are four times fewer accesses and
+    the probe pipelines them, which takes the same image under half a minute.
+    Trailing bytes are padded with 0xFF - the mailbox is told the real length,
+    so the padding is never programmed.
+    """
+    data = bytes(data)
+    pad = (-len(data)) % 4
+    if pad:
+        data += bytes([0xFF]) * pad
+    words = [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+    jlink.memory_write32(addr, words)
+
+
 def run_mail(jlink, cmd, addr, length):
     words = [MAGIC, cmd, addr, length, BUF, 0, 0]
     jlink.halt()
@@ -233,7 +260,17 @@ def open_probe(serial):
     if "--probe-power" in sys.argv:
         jlink.power_on(default=True)
         time.sleep(0.3)
-    jlink.connect("DA14585", speed=500, verbose=True)
+    jlink.connect("DA14585", speed=probe_speed(), verbose=True)
+    # Reset and halt before anything else. Halting a running tag leaves
+    # whatever it was doing half done, and a core that has hard-faulted into
+    # lockup will not execute the RAM flasher at all - that shows up as
+    # "flasher did not halt cmd 1" and is otherwise baffling. Coming out of
+    # reset halted gives the same clean start every time.
+    try:
+        jlink.reset(halt=True)
+    except Exception:
+        jlink.halt()
+    time.sleep(0.05)
     jlink.halt()
     if not wake_peripherals(jlink):
         jlink.close()
@@ -252,7 +289,7 @@ def open_probe(serial):
     jlink.memory_write16(SET_FREEZE_REG, [FRZ_WDOG])
     quiet_ble(jlink)
     print("watchdog frozen, BLE timer held in reset")
-    jlink.memory_write8(ENTRY, list(FLASHER.read_bytes()))
+    write_bytes(jlink, ENTRY, FLASHER.read_bytes())
     return jlink
 
 
@@ -276,7 +313,7 @@ def program(image, serial):
             page_off = (BANK + offset) & 0xFF
             room = 256 - page_off
             chunk = image[offset:offset + room]
-            jlink.memory_write8(BUF, list(chunk))
+            write_bytes(jlink, BUF, chunk)
             run_mail(jlink, CMD_PROGRAM, BANK + offset, len(chunk))
             offset += len(chunk)
             if offset % 4096 == 0 or offset == len(image):

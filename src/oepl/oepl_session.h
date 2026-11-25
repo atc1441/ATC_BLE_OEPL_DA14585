@@ -99,11 +99,28 @@
 #define OEPL_TYPE_RAW_1BPP  0x20u
 #define OEPL_TYPE_RAW_2BPP  0x21u
 #define OEPL_TYPE_ZLIB      0x30u
+/* An AvailDataInfo that carries a command instead of data. The argument
+ * byte says which: 0 reboots, and 0xA0 plus a board config id selects that
+ * config - the way an access point configures a tag it found in config
+ * mode. Hardware type 0xFA is what a tag advertises while it has no config,
+ * and what the access point's ConfigMode tag type matches on.
+ */
+#define OEPL_TYPE_COMMAND   0xAFu
+#define OEPL_CMD_ARG_REBOOT 0x00u
+#define OEPL_CMD_ARG_CONFIG 0xA0u
+#define OEPL_HW_CONFIG_MODE 0x00FAu
 /* Block-transfer NDEF. 0xA2 is a bare message and arrives only on SET_NDEF. */
 #define OEPL_NDEF_RAW       0xA0u
 #define OEPL_NDEF_URL       0xA1u
 #define OEPL_NDEF_MSG       0xA2u
-#define OEPL_NDEF_MAX       512u
+/* 256, not 512. This image runs out of SysRAM, so the NDEF store costs the
+ * same memory as code does, and it is kept twice: once here and once in the
+ * scratch the TLV is unwrapped into. A URL record - which is what an access
+ * point sends and what the NFC chip is for - is well under a hundred bytes,
+ * the chip's own data area is 888, and a record that does not fit is
+ * refused with an error rather than silently cut.
+ */
+#define OEPL_NDEF_MAX       256u
 #define OEPL_NDEF_CHUNK     160u
 /* Set: a reader must not be given the command channel. The NDEF file stays. */
 #define OEPL_NDEF_FLAG_NO_CMDS 0x01u
@@ -293,16 +310,83 @@ OEPL_API int oepl_fw_vectors(const uint8_t vectors[8]);
 OEPL_API void oepl_frame_put(uint8_t dst[2], uint16_t cmd);
 OEPL_API uint16_t oepl_frame_get(const uint8_t src[2]);
 
-/* Advertising payload without the 3-byte flags the controller adds.
- * Manufacturer record is version 2: company 0x1337, hardware type, firmware
- * version, capabilities, battery, temperature, then a counter. The complete
- * local name follows in the same packet. Returns 0 when it does not fit.
+/* Capability bits an access point reads out of the advertisement. Only the
+ * ones this firmware has an opinion about are named here.
+ */
+#define OEPL_CAP_LED          0x0001u
+#define OEPL_CAP_COMPRESSION  0x0002u
+#define OEPL_CAP_NFC          0x0040u
+#define OEPL_CAP_IS_BLE       0x0100u
+/* Says the two extra fields below are on the air. An access point that does
+ * not know them ignores both; one that does checks this bit first.
+ */
+#define OEPL_CAP_ADV_EXTENDED 0x0200u
+
+/* Why the tag last woke, in the low nibble of the advertised wake byte. Zero
+ * to six are the numbers this protocol uses itself and pass straight
+ * through; the ones it numbers from 0xE0 up do not fit in a nibble and get a
+ * code of their own here.
+ */
+#define OEPL_WAKE_TIMED     0u
+#define OEPL_WAKE_BOOT      1u
+#define OEPL_WAKE_GPIO      2u
+#define OEPL_WAKE_NFC       3u
+#define OEPL_WAKE_FAILED_FW 7u
+#define OEPL_WAKE_FIRSTBOOT 8u
+#define OEPL_WAKE_SCAN      9u
+#define OEPL_WAKE_WDT       10u
+
+/* CRC-16/CCITT-FALSE: init 0xFFFF, polynomial 0x1021, nothing reflected and
+ * nothing xored out. An access point runs exactly this over a dataVer.
+ */
+OEPL_API uint16_t oepl_crc16_ccitt(const uint8_t *data, uint8_t len);
+
+/* The advertised image CRC: the CRC of the eight bytes of ver, little end
+ * first, which is the order both sides hold them in. A tag showing no
+ * transferred picture has ver 0, whose CRC is 0x313E - not a reserved value
+ * but simply what the function returns for eight zero bytes, so both sides
+ * get there by running the same bytes through the same code.
+ */
+OEPL_API uint16_t oepl_image_crc(uint64_t ver);
+
+/* The wake byte: the event counter in the top nibble, the reason in the
+ * bottom one. The counter is what makes this usable from a passive scan - a
+ * reason on its own is a state that stays put, and an advertisement cannot
+ * be acknowledged, so a receiver keeps the last byte it saw and acts when it
+ * changes.
+ */
+OEPL_API uint8_t oepl_wake_byte(uint8_t counter, uint8_t reason);
+
+/* The advertising payload, without the 3-byte flags the controller adds:
+ * one manufacturer record, company 0x1337, version 2 - hardware type,
+ * firmware version, capabilities, battery, temperature, a counter, then the
+ * image CRC and the wake byte.
+ *
+ * Those last three bytes sit behind the version-2 layout rather than behind
+ * a version of their own, and that is deliberate: an access point
+ * dispatches on the version byte and ends in "not supported", so a tag
+ * announcing version 3 would not lose a field on an older one - it would
+ * disappear from it altogether. Appended, an access point that knows
+ * version 2 copies its own 13 bytes and never looks further, while a newer
+ * one finds them because the record is longer and because
+ * OEPL_CAP_ADV_EXTENDED says they are there.
+ *
+ * The name is not in here. 16 bytes of manufacturer data and a ten
+ * character name together are more than the 31 an advertisement holds, so
+ * the name goes in the scan response - which is where the reference
+ * firmware keeps it too. Returns 0 when it does not fit.
  */
 OEPL_API uint8_t oepl_adv_payload(uint8_t *dst, uint8_t cap,
                                   uint16_t hw_type, uint16_t fw_version,
                                   uint16_t capabilities, uint16_t battery_mv,
                                   int8_t temperature, uint8_t counter,
-                                  const uint8_t *name, uint8_t name_len);
+                                  uint16_t img_crc, uint8_t wake_reason);
+
+/* The scan response: the 16-bit service UUID, then the complete local name.
+ * Returns 0 when it does not fit.
+ */
+OEPL_API uint8_t oepl_scan_payload(uint8_t *dst, uint8_t cap,
+                                   const uint8_t *name, uint8_t name_len);
 
 /* Image bytes expected for a raw type. Returns 0 when the type or geometry is unusable. */
 OEPL_API int oepl_expected_size(const oepl_panel *panel, uint8_t type, uint32_t *size_out);

@@ -12,6 +12,7 @@
 #include "gapc_task.h"
 #include "gattc_task.h"
 #include "ke_msg.h"
+#include "nfc.h"
 #include "oepl_session.h"
 #include "panel.h"
 #include "prf_types.h"
@@ -24,17 +25,27 @@
 
 #include <string.h>
 
-/* Received pictures live past the product header and the waveform.
- * A firmware file is staged here, then copied into the application bank.
- * The boot image, pin record, geometry, waveform and product header stay put.
+/* Received pictures live past the product header and the waveform, and a
+ * firmware file is staged there too before it is copied into the bank. Where
+ * exactly is a property of the board, not of this file: the 7.5 inch board
+ * has 512 KiB of flash and the 13.3 inch one 2 MiB, and the bigger glass
+ * needs a bigger window than the small chip has. The selected catalog row
+ * carries both ends of it; the last 4 KiB sector holds the ATCIMG marker,
+ * which a finished refresh writes and an upload erases.
  */
-#define ATC_IMAGE_BASE 0x00060000u
-#define ATC_FLASH_END  0x00080000u
-/* Past the two image planes. A stored picture writes this after a refresh.
- * An upload or a firmware file erases the 64 KB block, so the next boot
- * draws the status screen again.
+#define ATC_IMAGE_BASE (img_window_base)
+#define ATC_FLASH_END  (img_window_end)
+#define ATC_MARK_ADDR  (img_window_end - ATC_PANEL_MARKER)
+
+/* Where that window is. Worked out once the flash has said how big it is -
+ * see flash_bringup() - from the chip size and the glass. Until then, and
+ * on a tag nobody has configured, these are the 128 KiB every one of these
+ * boards has room for: a firmware update is staged in the picture window,
+ * and that has to work before a tag knows which glass it has.
  */
-#define ATC_MARK_ADDR  0x0007F000u
+static uint32_t img_window_base = ATC_PANEL_LOW;
+static uint32_t img_window_end = ATC_PANEL_LOW + ATC_PANEL_MIN;
+static uint32_t flash_bytes;
 #define ATC_BANK_BASE  0x0001F000u
 #define ATC_BANK_END   0x00038000u
 #define ATC_SECTOR     4096u
@@ -83,12 +94,29 @@ const uint8_t custs1_services[] = {ATC_IDX_SVC, ATC_IDX_NB};
 const uint8_t custs1_services_size = 1;
 const uint16_t custs1_att_max_nb = ATC_IDX_NB;
 
-/* Capabilities reported in advertising and in GET_INFOS. */
-#define ATC_CAPABILITIES  0x01C3u
-/* Little-endian on the air: bytes 0x30, 0x00. Decimal 48. The access point
+/* Capabilities reported in advertising and in GET_INFOS, built from the
+ * board config rather than fixed. The constant this replaces claimed an LED
+ * and an NFC wake on every board, including the ones that have neither.
+ *
+ * OEPL_CAP_ADV_EXTENDED is the one an access point looks at before reading
+ * the two fields at the end of the advertisement.
+ */
+static uint16_t atc_capabilities(void)
+{
+    uint16_t caps = OEPL_CAP_IS_BLE | OEPL_CAP_COMPRESSION | OEPL_CAP_ADV_EXTENDED;
+
+    if (atc_panel_has(ATC_CAP_LED)) {
+        caps |= OEPL_CAP_LED;
+    }
+    if (atc_panel_has(ATC_CAP_NFC)) {
+        caps |= OEPL_CAP_NFC;
+    }
+    return caps;
+}
+/* Little-endian on the air: bytes 0x31, 0x00. Decimal 49. The access point
  * turns on zlib images once a tag reports a version of 0x27 or higher.
  */
-#define ATC_FW_VERSION    0x0030u
+#define ATC_FW_VERSION    0x0036u
 
 extern struct bd_addr dev_bdaddr;
 
@@ -125,8 +153,29 @@ static uint8_t fw_staged;
 static timer_hnd store_timer = EASY_TIMER_INVALID_TIMER;
 static void image_erase_arm(uint16_t delay);
 static void image_erase_tick(void);
+/* The advertised wake byte, see wake_event(). The command handler clears
+ * the reason long before the builder down the file reads it.
+ */
+static void wake_event(uint8_t reason);
+static void wake_timed(void);
 static void store_arm(uint16_t delay);
-static const uint8_t image_mark[8] = {'A', 'T', 'C', 'I', 'M', 'G', 1, 0};
+/* The marker sector: six bytes of name, a layout number, a zero, and then
+ * the eight bytes of the dataVer that is on the glass.
+ *
+ * Layout 1 - what earlier firmware wrote - is the same record without the
+ * version, and still means "a picture is on the glass"; the version is then
+ * simply unknown, so the tag asks for it again and advertises no image.
+ *
+ * The version is read back at boot, but a configured tag then draws its
+ * status screen over the picture - gui_arm() does that on every boot on
+ * purpose - and the screen clears it again, which is right: the picture is
+ * no longer what is on the glass, the advertisement says so, and the next
+ * AvailDataInfo redraws it. What the version is actually for is the tag
+ * that comes up and does not redraw, the unconfigured one, which leaves
+ * the glass alone and should keep saying what is on it.
+ */
+static const uint8_t image_mark[8] = {'A', 'T', 'C', 'I', 'M', 'G', 2, 0};
+#define ATC_MARK_BYTES 16u
 static uint8_t led_color;
 static uint8_t temp_tries;
 static uint8_t temp_valid;
@@ -141,10 +190,11 @@ static uint8_t adv_on;
 /* 0 unknown, 1 slow (30-50 ms), 2 fast (7.5-15 ms). */
 static uint8_t link_mode;
 static uint8_t link_want;
+static uint16_t link_interval;      /* 1.25 ms units, as the link reports it */
+static uint16_t link_tx_octets;     /* data channel PDU payload actually in use */
 static uint8_t link_inflight;
 static uint8_t link_pending;
 static timer_hnd power_timer = EASY_TIMER_INVALID_TIMER;
-static uint8_t power_action;
 
 /* Command 1 is the lamp. 0 is off, 1 red, 2 green, 3 blue, 4 red+green,
  * 5 red+blue, 6 green+blue, 7 every pad. A missing color byte lights every
@@ -158,6 +208,7 @@ static uint8_t power_action;
 #define ATC_CMD_SETMAC   0x0009u
 /* Advertising interval, big-endian, in 0.625 ms slots. 100..10000, else 3200. */
 #define ATC_CMD_PERIOD 0x0008u
+/* Acknowledged and then ignored. See the handler. */
 #define ATC_CMD_DEEP   0x0014u
 #define ATC_CMD_REBOOT 0x0017u
 /* This build's own, see OEPL_CMD_SLEEP: 0 off, 1 extended sleep. RAM only. */
@@ -235,14 +286,6 @@ static uint8_t sleep_mode_on;
 static uint16_t sleep_woke;
 static uint16_t sleep_woke_said;
 
-#if ATC_POWER_PROBE
-/* Set once the probe has stopped the radio. Without it the stop is undone
- * immediately: app_easy_gap_advertise_stop() ends in user_on_adv_complete(),
- * which arms atc_adv_tick(), which calls user_advertise() again.
- */
-static uint8_t probe_quiet;
-#endif
-
 static timer_hnd atc_timer(uint32_t delay, void (*fn)(void))
 {
     timer_hnd h = app_easy_timer((uint16_t)delay, fn);
@@ -269,13 +312,9 @@ static const struct led_pad led_pads[] = {
     {LED_R_PORT, LED_R_PIN, 0x01},
     {LED_G_PORT, LED_G_PIN, 0x02},
     {LED_B_PORT, LED_B_PIN, 0x04},
-    {LED_X_PORT, LED_X_PIN, 0x80},
     {LED_Y_PORT, LED_Y_PIN, 0x80},
     {LED_A_PORT, LED_A_PIN, 0x80},
     {LED_C_PORT, LED_C_PIN, 0x80},
-    {LED_D_PORT, LED_D_PIN, 0x80},
-    {LED_E_PORT, LED_E_PIN, 0x80},
-    {LED_F_PORT, LED_F_PIN, 0x80},
     {LED_Z_PORT, LED_Z_PIN, 0x80},
 };
 
@@ -556,7 +595,29 @@ static int flash_bringup(void)
     }
     env.dev_index = AT25XE041B_DEV_INDEX;
     env.jedec_id = jedec;
-    env.chip_size = SPI_FLASH_SIZE_4MBIT;
+    /* Take the size from the chip rather than from a constant.
+     *
+     * The third JEDEC byte is log2 of the capacity: 0x13 is the 512 KiB part
+     * on the 7.5 inch board, 0x15 the 2 MiB one on the 13.3 inch board. This
+     * used to be nailed to SPI_FLASH_SIZE_4MBIT, and the SDK clamps a read to
+     * chip_size - address: on the bigger board a read above 512 KiB made that
+     * subtraction wrap to 0xFFF01000 bytes, the driver wrote that much into an
+     * 8-byte buffer, and the tag hard-faulted on every boot. Found exactly
+     * that way - the fault frame still had 0x0017F000 and 0xFFF01000 on it.
+     */
+    {
+        uint8_t capacity = (uint8_t)(jedec & 0xFFu);
+        uint32_t size = SPI_FLASH_SIZE_4MBIT;
+
+        if (capacity >= 16u && capacity <= 24u) {
+            size = 1UL << capacity;
+        }
+        env.chip_size = size;
+        flash_bytes = size;
+        rtt_puts("flash size ");
+        rtt_u32(size);
+        rtt_puts("\n");
+    }
     spi_flash_configure_env(&env);
     status = spi_flash_configure_memory_protection(SPI_FLASH_MEM_PROT_NONE);
     rtt_puts("flash prot ");
@@ -564,6 +625,26 @@ static int flash_bringup(void)
     rtt_puts("\n");
     flash_open = 1;
     return 0;
+}
+
+/* Put the picture window where this chip and this glass allow, and say
+ * whether it fits at all. A 960 by 680 picture needs 163200 bytes and does
+ * not fit a 512 KiB board; the same firmware on a 2 MiB board has room for
+ * it with space to spare. Nothing here is compiled in: the size comes from
+ * the chip's own JEDEC id, read in flash_bringup().
+ */
+static int window_apply(const atc_panel *row)
+{
+    uint32_t base = 0;
+    uint32_t end = 0;
+    uint32_t size = flash_bytes != 0u ? flash_bytes : (ATC_PANEL_LOW + ATC_PANEL_MIN);
+
+    if (!atc_panel_window(row, size, &base, &end)) {
+        return 0;
+    }
+    img_window_base = base;
+    img_window_end = end;
+    return 1;
 }
 
 /* 0: the sector erase command was accepted. 1: the chip is still busy, so
@@ -705,7 +786,7 @@ static int flash_write(uint32_t address, const uint8_t *data, uint32_t len)
  * changed in place. Storing and rebooting is the honest way to do it, and it
  * is also what the reference firmware does.
  */
-static void power_schedule(uint8_t action);
+static void reboot_schedule(void);
 
 static atc_settings atc_cfg;
 static uint8_t cfg_loaded;
@@ -843,7 +924,7 @@ static void cfg_step(void)
         }
         cfg_phase = 0;
         rtt_puts("cfg reboot\n");
-        power_schedule(1u);
+        reboot_schedule();
         return;
     }
     cfg_phase = 0;
@@ -890,17 +971,81 @@ void atc_early_init(void)
     done = 1;
     rtt_init();
     cfg_load();
-    if (atc_cfg.config_id != 0u && !atc_panel_select(atc_cfg.config_id)) {
-        /* The record names a config this build does not carry - an older
-         * firmware put back on a tag somebody had configured. Stay
-         * unconfigured rather than refuse to start; a host can set it again.
-         */
-        rtt_puts("cfg unknown\n");
+    if (atc_cfg.config_id != 0u) {
+        const atc_panel *row = atc_panel_find_config(atc_cfg.config_id);
+
+        if (row == 0 || !atc_panel_usable(row)) {
+            /* The record names a config this build does not carry - an older
+             * firmware put back on a tag somebody had configured. Stay
+             * unconfigured rather than refuse to start; a host can set it
+             * again.
+             */
+            rtt_puts("cfg unknown\n");
+        } else if (!window_apply(row)) {
+            /* Right config, wrong board: this glass wants more flash than
+             * this one has, and a picture would have nowhere to live.
+             */
+            rtt_puts("cfg too big for this flash\n");
+        } else {
+            atc_panel_select(atc_cfg.config_id);
+        }
+    } else {
+        window_apply(atc_panel_get());
     }
     if (atc_settings_bd_addr(&atc_cfg, addr)) {
         memcpy(dev_bdaddr.addr, addr, sizeof addr);
         rtt_puts("cfg mac\n");
     }
+}
+
+/* Store a board config, whichever way a host asked for it.
+ *
+ *   1: stored, and the tag will reboot into it.
+ *   0: it is already that config; nothing was written and nothing reboots.
+ *  -1: refused - not in the catalog, too big for the flash fitted, or the
+ *      tag is busy with a picture it would lose.
+ */
+static int config_set(uint16_t want)
+{
+    const atc_panel *row = atc_panel_find_config(want);
+    atc_settings next;
+
+    if (want != ATC_CFG_NONE) {
+        if (row == 0 || !atc_panel_usable(row)) {
+            rtt_puts("config refused ");
+            rtt_hex16(want);
+            rtt_puts("\n");
+            return -1;
+        }
+        if (!atc_panel_window(row, flash_bytes, 0, 0)) {
+            /* A real config, but not on this board: its picture does not fit
+             * the flash that is fitted. Storing it would come back up unable
+             * to hold a picture, so say no now.
+             */
+            rtt_puts("config needs more flash ");
+            rtt_hex16(want);
+            rtt_puts("\n");
+            return -1;
+        }
+    }
+    if (want == atc_session.screen_type) {
+        /* Already this config. A host that sets the type on every connect
+         * should not keep restarting the tag.
+         */
+        return 0;
+    }
+    if (refresh_active || refresh_pending || atc_session.active) {
+        return -1;
+    }
+    next = atc_cfg;
+    next.config_id = want;
+    if (!cfg_store(&next, 1u)) {
+        return -1;
+    }
+    rtt_puts("config stored ");
+    rtt_hex16(want);
+    rtt_puts("\n");
+    return 1;
 }
 
 /* 16-byte record at ATC_NDEF_ADDR, then the bare message. Byte 9 is the XOR. */
@@ -949,6 +1094,7 @@ static void ndef_load(void)
 }
 
 static void ndef_commit(void);
+static void nfc_store_arm(void);
 
 static void ndef_arm(uint32_t delay)
 {
@@ -1065,13 +1211,168 @@ static void ndef_commit(void)
     atc_session.ndef_dirty = 0;
     ndef_busy = 0;
     rtt_puts("ndef saved\n");
+    nfc_store_arm();
+}
+
+/* And now the same record into the NFC chip, which is the only copy a
+ * phone can see. The chip wants a type 2 TLV - 0x03, the length, the
+ * message, then 0xFE - while the session keeps the bare message, so the
+ * wrapper is added here, a page at a time straight out of
+ * atc_session.ndef_msg rather than into a second 512 byte buffer this
+ * image has no room for.
+ *
+ * One page per timer tick: each page has to burn in before the next is
+ * accepted, and a long record would otherwise hold a single callback for
+ * longer than the link can be ignored.
+ */
+static timer_hnd nfc_timer = EASY_TIMER_INVALID_TIMER;
+static uint16_t nfc_sent;
+static uint16_t nfc_total;
+static uint8_t nfc_on;
+static uint8_t nfc_open;
+
+static uint16_t nfc_head_len(uint16_t len)
+{
+    /* Over 254 bytes a type 2 TLV carries a three byte length. */
+    return (len < 255u) ? 2u : 4u;
+}
+
+/* Byte i of the TLV stream, without building the stream anywhere. */
+static uint8_t nfc_stream_byte(uint16_t i, uint16_t len)
+{
+    uint16_t head = nfc_head_len(len);
+
+    if (len == 0u) {
+        return 0xFEu;                      /* an empty data area */
+    }
+    if (i == 0u) {
+        return 0x03u;
+    }
+    if (head == 2u) {
+        if (i == 1u) {
+            return (uint8_t)len;
+        }
+    } else {
+        if (i == 1u) {
+            return 0xFFu;
+        }
+        if (i == 2u) {
+            return (uint8_t)(len >> 8);
+        }
+        if (i == 3u) {
+            return (uint8_t)len;
+        }
+    }
+    if (i < (uint16_t)(head + len)) {
+        return atc_session.ndef_msg[i - head];
+    }
+    return 0xFEu;                          /* the terminator */
+}
+
+static void nfc_stop(const char *why)
+{
+    if (nfc_open) {
+        atc_nfc_end();
+        nfc_open = 0;
+    }
+    nfc_on = 0;
+    nfc_timer = EASY_TIMER_INVALID_TIMER;
+    if (why != 0) {
+        rtt_puts(why);
+    }
+}
+
+static void nfc_tick(void)
+{
+    uint8_t page[ATC_NFC_PAGE];
+    uint16_t at;
+    uint8_t room;
+    uint8_t have;
+    uint8_t i;
+
+    nfc_timer = EASY_TIMER_INVALID_TIMER;
+    wdg_reload(WATCHDOG_DEFAULT_PERIOD);
+    if (!nfc_on) {
+        return;
+    }
+    /* The chip can wait; a refresh, an update or a transfer cannot. */
+    if (refresh_active || refresh_pending || ota_busy || atc_session.active) {
+        nfc_timer = atc_timer(50, nfc_tick);
+        return;
+    }
+    if (!nfc_open) {
+        if (!atc_nfc_begin()) {
+            nfc_stop("nfc silent\n");
+            return;
+        }
+        nfc_open = 1;
+    }
+    at = (uint16_t)(ATC_NFC_DATA_AT + nfc_sent);
+    room = (uint8_t)(ATC_NFC_PAGE - (at % ATC_NFC_PAGE));
+    have = room;
+    if ((uint16_t)(nfc_total - nfc_sent) < room) {
+        have = (uint8_t)(nfc_total - nfc_sent);
+    }
+    /* The whole page goes out even when the record ends inside it, with
+     * zeros behind the terminator. A reader stops at the terminator either
+     * way, but a longer record that was there before otherwise leaves its
+     * tail sitting right behind the new one, which is a puzzle for anyone
+     * who dumps the chip. The page is being written anyway, so this costs
+     * nothing. Only this page is cleared, not the rest of the area: wiping
+     * 888 bytes on every record would be fifty-odd writes of wear to tidy
+     * up bytes nothing reads.
+     */
+    for (i = 0; i < room; i++) {
+        page[i] = (i < have)
+            ? nfc_stream_byte((uint16_t)(nfc_sent + i), atc_session.ndef_len)
+            : 0x00u;
+    }
+    if (!atc_nfc_page(at, page, room)) {
+        nfc_stop("nfc write\n");
+        return;
+    }
+    nfc_sent = (uint16_t)(nfc_sent + have);
+    if (nfc_sent >= nfc_total) {
+        nfc_stop("nfc stored\n");
+        return;
+    }
+    nfc_timer = atc_timer(1, nfc_tick);
+}
+
+static void nfc_store_arm(void)
+{
+    if (!atc_panel_has(ATC_CAP_NFC)) {
+        return;
+    }
+    if (nfc_timer != EASY_TIMER_INVALID_TIMER) {
+        app_easy_timer_cancel(nfc_timer);
+        nfc_timer = EASY_TIMER_INVALID_TIMER;
+    }
+    if (nfc_open) {
+        atc_nfc_end();
+        nfc_open = 0;
+    }
+    nfc_sent = 0;
+    nfc_total = (atc_session.ndef_len == 0u)
+        ? 1u
+        : (uint16_t)(nfc_head_len(atc_session.ndef_len) + atc_session.ndef_len + 1u);
+    nfc_on = 1;
+    nfc_timer = atc_timer(1, nfc_tick);
+    if (nfc_timer == EASY_TIMER_INVALID_TIMER) {
+        nfc_on = 0;
+        rtt_puts("nfc timer\n");
+    }
 }
 
 /* One slice of the copy, then back to the kernel. A single pass erases and
  * programs the bank for longer than the 6 s supervision timeout, so the
  * success notify never leaves. The header is still written last.
+ *
+ * 512 rather than 1024: this buffer is pure SysRAM, the image has little
+ * of it left, and halving it only costs a few more flash reads during an
+ * update that already takes the better part of a minute.
  */
-#define OTA_CHUNK 1024u
+#define OTA_CHUNK 512u
 
 static oepl_fw_view ota_view;
 static uint8_t ota_head[OEPL_FW_HEADER];
@@ -1085,7 +1386,7 @@ static uint8_t ota_wiped;
 static uint8_t ota_erase_wait;
 
 static void notify_reply(const uint8_t *payload, uint16_t length);
-static void power_schedule(uint8_t action);
+static void reboot_schedule(void);
 static void ota_step(void);
 
 static void ota_arm(void)
@@ -1311,7 +1612,7 @@ static void ota_step(void)
         oepl_frame_put(reply, OEPL_CMD_FW_OK);
         notify_reply(reply, 2);
         rtt_puts("ota reboot\n");
-        power_schedule(1);
+        reboot_schedule();
         return;
     }
     ota_arm();
@@ -1361,6 +1662,22 @@ static void write_u64(uint8_t *dst, uint64_t value)
  * AvailDataInfo, so one abandoned upload would need a power cycle to clear.
  * After ATC_STALL_TRIES fruitless requests the transfer is abandoned.
  */
+/* How long to wait for the first part of a block before asking again.
+ *
+ * This used to be 300 ms, which is shorter than one round trip on the hosts
+ * that matter: measured on this tag, a part costs about 210 ms over a
+ * Windows link and an access point is slower still. So the retry fired
+ * before the first part had had a chance to arrive, and a second block
+ * request is not harmless - the access point treats one as "start this
+ * block again", resets its part counter and resends from the beginning. On
+ * a one-part transfer like an NFC record that is enough to make the whole
+ * thing look like it never arrived, which is exactly how it looked.
+ *
+ * 1.5 s is longer than any round trip seen here and still well inside the
+ * access point's own 30 s patience. Parts genuinely lost in the middle of a
+ * block are the stall guard's job, not this one's.
+ */
+#define ATC_BLOCK_RETRY_TICKS 150u
 #define ATC_STALL_TICKS 40u  /* easy-timer units of 10 ms, so 400 ms */
 #define ATC_STALL_TRIES 12u
 
@@ -1550,7 +1867,7 @@ static void image_erase_tick(void)
     image_hold_on = 0;
     block_answered = 0u;
     notify_reply(image_hold, image_hold_len);
-    atc_timer(30, push_packed_again);
+    atc_timer(ATC_BLOCK_RETRY_TICKS, push_packed_again);
 }
 
 static int image_plane_type(uint8_t type)
@@ -1649,6 +1966,15 @@ static void log_follow(void)
 {
     if (atc_connected && atc_session.log_stream) {
         rtt_log_enable(1);
+        /* A host that arms the log after connecting missed the lines about
+         * the link itself, and those are exactly what a slow transfer is
+         * about. Say them again.
+         */
+        rtt_puts("link iv ");
+        rtt_u32(link_interval);
+        rtt_puts(" dle ");
+        rtt_u32(link_tx_octets);
+        rtt_puts("\n");
         log_arm(1);
         return;
     }
@@ -1764,9 +2090,25 @@ static void refresh_timer(void)
     refresh_active = 0;
     if (rc == 0) {
         rtt_puts("refresh ok\n");
-        if (refresh_source == 0u && flash_write(ATC_MARK_ADDR, image_mark, sizeof image_mark) == 0) {
-            image_kept = 1u;
-            rtt_puts("image kept\n");
+        if (refresh_source == 0u) {
+            uint8_t rec[ATC_MARK_BYTES];
+            uint8_t i;
+
+            memcpy(rec, image_mark, sizeof image_mark);
+            for (i = 0; i < 8u; i++) {
+                rec[8u + i] = (uint8_t)(atc_session.shown_ver >> (8u * i));
+            }
+            if (flash_write(ATC_MARK_ADDR, rec, sizeof rec) == 0) {
+                image_kept = 1u;
+                rtt_puts("image kept\n");
+            }
+        } else {
+            /* The tag drew its own screen, so there is no transferred
+             * picture on the glass any more. Say so, or the access point
+             * reads the CRC of an image that is not there.
+             */
+            atc_session.has_shown = 0;
+            atc_session.shown_ver = 0;
         }
     } else {
         rtt_puts("refresh fail\n");
@@ -1839,8 +2181,13 @@ static void link_apply(uint8_t mode)
     }
     cmd->latency = 0;
     cmd->time_out = ATC_LINK_TIMEOUT;
+    /* Connection event length, in 0.625 ms units. Zero means "no
+     * preference", which a central is free to read as "keep it short" -
+     * and a short event is one or two packets, which is what makes a
+     * transfer crawl. Ask for room to finish a part in one event.
+     */
     cmd->ce_len_min = 0;
-    cmd->ce_len_max = 0;
+    cmd->ce_len_max = (mode == 2u) ? 8u : 2u;
     link_inflight = mode;
     link_pending = 1;
     rtt_puts(mode == 2u ? "link fast\n" : "link slow\n");
@@ -1854,7 +2201,7 @@ static void link_slow_later(void)
     }
 }
 
-static void power_fire(void)
+static void reboot_fire(void)
 {
     power_timer = EASY_TIMER_INVALID_TIMER;
     if (refresh_active || refresh_pending || ota_busy || atc_session.active) {
@@ -1868,27 +2215,46 @@ static void power_fire(void)
          * failed when it was the reboot that never happened.
          */
         rtt_puts("power busy\n");
-        power_timer = atc_timer(50, power_fire);
+        power_timer = atc_timer(50, reboot_fire);
         return;
     }
-    if (power_action == 1u) {
-        rtt_puts("reboot\n");
-        platform_reset(RESET_AFTER_SUOTA_UPDATE);
-    }
-    if (power_action == 2u) {
-        rtt_puts("deep\n");
-        arch_set_deep_sleep(false);
-    }
+    rtt_puts("reboot\n");
+    platform_reset(RESET_AFTER_SUOTA_UPDATE);
 }
 
-static void power_schedule(uint8_t action)
+/* There used to be a second action here, command 0x0014, which put the
+ * chip into deep sleep. It is gone on purpose: nothing on this board can
+ * wake it out of that again. The reset pin cannot restart a DA14585 - RST
+ * is active high and nRESET is open drain - so a tag given that command
+ * came back only by losing power, which on a sealed label means opening
+ * it. A command whose only way out is a screwdriver has no business being
+ * reachable over the air. 0x0017 reboots, which is what it was wanted for
+ * anyway.
+ */
+static void reboot_schedule(void)
 {
-    power_action = action;
     if (power_timer != EASY_TIMER_INVALID_TIMER) {
         app_easy_timer_cancel(power_timer);
     }
     /* 500 ms lets the acknowledgement leave before the radio stops. */
-    power_timer = atc_timer(50, power_fire);
+    power_timer = atc_timer(50, reboot_fire);
+}
+
+void user_on_data_length_change(const uint8_t conidx, struct gapc_le_pkt_size_ind *ind)
+{
+    /* The SDK's own app task eats GAPC_LE_PKT_SIZE_IND before the catch-all
+     * sees it, so this is the only place the negotiated packet size shows
+     * up. It matters: a 233-byte picture part is one data channel packet at
+     * 251 octets and nine of them at 27, and the link carries about one
+     * packet per connection event.
+     */
+    (void)conidx;
+    link_tx_octets = ind->max_tx_octets;
+    rtt_puts("dle tx ");
+    rtt_u32(ind->max_tx_octets);
+    rtt_puts(" rx ");
+    rtt_u32(ind->max_rx_octets);
+    rtt_puts("\n");
 }
 
 void user_on_update_params_complete(void)
@@ -2030,6 +2396,8 @@ static void deliver_reply(const uint8_t *reply, uint16_t reply_len)
                    || out == OEPL_CMD_FW_OK || out == OEPL_CMD_ERR
                    || out == OEPL_CMD_FILE_BIG) {
             stall_disarm();
+            /* The transfer is over, so hand the airtime back. */
+            link_apply(1);
         }
     }
     if (atc_session.ndef_dirty && !ndef_busy) {
@@ -2139,8 +2507,7 @@ static void on_write(const struct custs1_val_write_ind *ind)
      */
     if (cmd == ATC_CMD_SETTYPE) {
         uint16_t want;
-        const atc_panel *row;
-        atc_settings next;
+        int rc;
 
         if (ind->length < 4u) {
             oepl_frame_put(reply, OEPL_CMD_ERR);
@@ -2148,44 +2515,8 @@ static void on_write(const struct custs1_val_write_ind *ind)
             return;
         }
         want = (uint16_t)(((uint16_t)ind->value[2] << 8) | ind->value[3]);
-        row = atc_panel_find_config(want);
-        if (want != ATC_CFG_NONE && (row == 0 || !atc_panel_usable(row))) {
-            /* Not a config this build carries, or one whose picture would not
-             * fit the window. Refusing beats storing it and coming back up
-             * drawing nothing. Zero is not refused: it is the way back to
-             * unconfigured.
-             */
-            rtt_puts("config refused ");
-            rtt_hex16(want);
-            rtt_puts("\n");
-            oepl_frame_put(reply, OEPL_CMD_ERR);
-            notify_reply(reply, 2);
-            return;
-        }
-        if (want == atc_session.screen_type) {
-            /* Already this config. Acknowledge without a reboot: a host that
-             * sets the type on every connect should not restart the tag.
-             */
-            oepl_frame_put(reply, OEPL_CMD_ACK_CMD);
-            notify_reply(reply, 2);
-            return;
-        }
-        if (refresh_active || refresh_pending || atc_session.active) {
-            oepl_frame_put(reply, OEPL_CMD_ERR);
-            notify_reply(reply, 2);
-            return;
-        }
-        next = atc_cfg;
-        next.config_id = want;
-        if (!cfg_store(&next, 1u)) {
-            oepl_frame_put(reply, OEPL_CMD_ERR);
-            notify_reply(reply, 2);
-            return;
-        }
-        rtt_puts("config stored ");
-        rtt_hex16(want);
-        rtt_puts("\n");
-        oepl_frame_put(reply, OEPL_CMD_ACK_CMD);
+        rc = config_set(want);
+        oepl_frame_put(reply, rc < 0 ? OEPL_CMD_ERR : OEPL_CMD_ACK_CMD);
         notify_reply(reply, 2);
         return;
     }
@@ -2299,7 +2630,26 @@ static void on_write(const struct custs1_val_write_ind *ind)
         notify_reply(reply, 2);
         return;
     }
-    if (cmd == ATC_CMD_DEEP || cmd == ATC_CMD_REBOOT) {
+    /* Deep sleep: acknowledged, and then nothing happens.
+     *
+     * The chip really can go into deep sleep, and that is the problem -
+     * nothing on this board can wake it out of one. The reset pin cannot
+     * restart a DA14585, RST being active high and nRESET open drain, so a
+     * tag that was put to sleep came back only by losing power, which on a
+     * sealed label means opening it.
+     *
+     * Refusing the command is no better: an access point that gets an error
+     * simply asks again, and again. So it is accepted, which is what stops
+     * the asking, and the tag stays where a host can reach it. 0x0017 is
+     * there for anyone who wanted the tag to go away and come back.
+     */
+    if (cmd == ATC_CMD_DEEP) {
+        oepl_frame_put(reply, OEPL_CMD_ACK_CMD);
+        notify_reply(reply, 2);
+        rtt_puts("deep ignored\n");
+        return;
+    }
+    if (cmd == ATC_CMD_REBOOT) {
         if (refresh_active || refresh_pending || ota_busy || atc_session.active) {
             oepl_frame_put(reply, OEPL_CMD_ERR);
             notify_reply(reply, 2);
@@ -2307,31 +2657,69 @@ static void on_write(const struct custs1_val_write_ind *ind)
         }
         oepl_frame_put(reply, OEPL_CMD_ACK_CMD);
         notify_reply(reply, 2);
-        power_schedule(cmd == ATC_CMD_REBOOT ? 1u : 2u);
+        reboot_schedule();
         return;
     }
     if (cmd == OEPL_CMD_DEBUG_STS || cmd == OEPL_CMD_SYSINFO) {
         atc_read_battery();
         atc_read_panel_temp();
     }
-    /* A picture needs a glass to be the right size for. While the tag is
-     * unconfigured there is no size, and the session would refuse the
-     * transfer anyway because nothing matches a zero-by-zero panel - but it
-     * would refuse it without saying why. Firmware and NDEF transfers are
-     * let through: updating an unconfigured tag has to stay possible.
+    /* One look at an AvailDataInfo before the session sees it.
+     *
+     * Type 0xAF is not data but a command, which is how an access point
+     * configures a tag it has found in config mode: the argument is 0xA0
+     * plus the board config to use - the same numbering 0x0004 takes - and
+     * 0 means reboot. Hardware type 0xFA, which row 0 advertises, is what
+     * makes the access point offer that choice.
+     *
+     * And a picture needs a glass to be the right size for. While the tag
+     * is unconfigured there is no size; the session would refuse such a
+     * transfer anyway, because nothing matches a zero-by-zero panel, but it
+     * would refuse it without saying why. Firmware and NDEF transfers go
+     * through: updating an unconfigured tag has to stay possible.
      */
-    if (cmd == OEPL_CMD_AVAIL && !atc_panel_configured() && ind->length >= 2u) {
+    if (cmd == OEPL_CMD_AVAIL && ind->length >= 2u) {
         const uint8_t *body = ind->value + 2;
+        /* An access point has this tag on the line, so whatever the wake
+         * byte was reporting has been delivered. The counter stays where it
+         * is: this is the absence of an event.
+         */
+        wake_timed();
         uint16_t body_len = (uint16_t)(ind->length - 2u);
         uint8_t type = 0u;
+        uint8_t arg = 0u;
+        int rc;
 
         if (body_len >= 24u) {
             type = body[20];
+            arg = body[21];
         } else if (body_len >= OEPL_AVAIL_BYTES) {
             type = body[13];
+            arg = body[14];
         }
-        if (type != OEPL_TYPE_FW && type != OEPL_NDEF_RAW && type != OEPL_NDEF_URL) {
-            rtt_puts("avail refused, unconfigured\n");
+        if (type == OEPL_TYPE_COMMAND) {
+            rtt_puts("cmd arg ");
+            rtt_hex16(arg);
+            rtt_puts("\n");
+            if (arg >= OEPL_CMD_ARG_CONFIG) {
+                rc = config_set((uint16_t)(arg - OEPL_CMD_ARG_CONFIG));
+            } else if (arg == OEPL_CMD_ARG_REBOOT
+                       && !(refresh_active || refresh_pending || ota_busy
+                            || atc_session.active)) {
+                rc = 2;
+            } else {
+                rc = -1;
+            }
+            oepl_frame_put(reply, rc < 0 ? OEPL_CMD_ERR : OEPL_CMD_ACK_CMD);
+            notify_reply(reply, 2);
+            if (rc == 2) {
+                reboot_schedule();
+            }
+            return;
+        }
+        if (!atc_panel_configured() && type != OEPL_TYPE_FW
+            && type != OEPL_NDEF_RAW && type != OEPL_NDEF_URL) {
+            rtt_puts("no config\n");
             oepl_frame_put(reply, OEPL_CMD_ERR);
             notify_reply(reply, 2);
             return;
@@ -2388,8 +2776,19 @@ static void on_write(const struct custs1_val_write_ind *ind)
             if (hold_for_blank(reply, reply_len)) {
                 return;
             }
+            /* A transfer is starting, so ask for the short connection
+             * interval without waiting to be told.
+             *
+             * This link carries about one 27-byte packet per connection
+             * event - the DA14585 never negotiates longer packets, measured
+             * - so a 233-byte part costs nine events whatever else happens,
+             * and the interval is what those events cost. An access point
+             * never sends 0x0002, so until now it got whatever interval it
+             * had chosen for itself.
+             */
+            link_apply(2);
             block_answered = 0u;
-            atc_timer(30, push_packed_again);
+            atc_timer(ATC_BLOCK_RETRY_TICKS, push_packed_again);
         }
         if (reply_len >= 2u && oepl_frame_get(reply) == OEPL_CMD_ALREADY) {
             rtt_puts("refresh already\n");
@@ -2699,19 +3098,54 @@ static void atc_mac_name(uint8_t name[10])
     device_info.dev_name.name[10] = 0;
 }
 
+/* Why this tag last came up, for the wake byte at the end of the
+ * advertisement.
+ *
+ * There is no reset-cause register to read: 0x50000304 is a DA14531 thing
+ * and reads back zero on a 585, and the SDK does not keep the code handed to
+ * platform_reset() either - platform_reset_func() only asserts on it and
+ * pulls SW_RESET. So every start reports BOOT, which is the part that
+ * matters: a receiver watching the byte sees the tag restart. A power-on
+ * and a commanded reboot are not told apart, and a watchdog reset is not
+ * either.
+ *
+ * The counter is what makes the byte readable without a connection. An
+ * advertisement cannot be acknowledged, so the reason stays standing until
+ * the next exchange clears it; a receiver keeps the last byte it saw per tag
+ * and acts when it changes. Which is also why clearing the reason must not
+ * move the counter - that is the absence of an event, not one.
+ */
+static uint8_t wake_counter;
+static uint8_t wake_reason = OEPL_WAKE_BOOT;
+
+static void wake_event(uint8_t reason)
+{
+    wake_counter++;
+    wake_reason = reason;
+}
+
+static void wake_timed(void)
+{
+    wake_reason = OEPL_WAKE_TIMED;
+}
+
 static void atc_load_adv(uint8_t *adv, uint8_t *adv_len, uint8_t *scan, uint8_t *scan_len)
 {
     uint8_t name[10];
-    static const uint8_t scan_rsp[] = {0x03, 0x03, 0x37, 0x13};
 
     atc_mac_name(name);
-    *adv_len = oepl_adv_payload(adv, (uint8_t)(ADV_DATA_LEN - 3),
+    /* The manufacturer record only. 16 bytes of it and a ten character name
+     * are more than an advertisement holds, so the name goes in the scan
+     * response - where the reference firmware keeps it too.
+     */
+    *adv_len = oepl_adv_payload(adv, ADV_DATA_LEN,
                                 atc_session.hw_type, atc_session.fw_version,
                                 atc_session.capabilities, atc_session.battery_mv,
-                                atc_session.temperature, atc_counter, name, 10);
+                                atc_session.temperature, atc_counter,
+                                oepl_image_crc(atc_session.shown_ver),
+                                oepl_wake_byte(wake_counter, wake_reason));
     atc_counter++;
-    memcpy(scan, scan_rsp, sizeof scan_rsp);
-    *scan_len = (uint8_t)sizeof scan_rsp;
+    *scan_len = oepl_scan_payload(scan, SCAN_RSP_DATA_LEN, name, 10);
 }
 
 void user_advertise(void);
@@ -2776,11 +3210,6 @@ static void atc_adv_tick(void)
         rtt_u32(sleep_woke);
         rtt_puts("\n");
     }
-#if ATC_POWER_PROBE
-    if (probe_quiet) {
-        return;
-    }
-#endif
     oepl_pin_tick(&atc_session, (uint16_t)tick_seconds);
     swd_release((uint16_t)tick_seconds);
     if (atc_session.log_stream && log_timer == EASY_TIMER_INVALID_TIMER) {
@@ -2826,167 +3255,6 @@ static void atc_adv_tick(void)
     atc_adv_timer = atc_timer(atc_tick_delay(), atc_adv_tick);
 }
 
-#if ATC_POWER_PROBE
-/* A staircase in the current trace, so the sleep floor can be attributed
- * instead of guessed at.
- *
- * Every ATC_PROBE_SECS the tag switches one more thing off and goes back to
- * sleep. One capture then shows a step per phase, and the step where the
- * floor drops names the consumer. The phases are cumulative on purpose: a
- * saving that only appears once two things are both quiet would otherwise be
- * invisible.
- *
- * Each phase announces itself first, by spinning the CPU for its own number
- * times 100 ms. That plateau is around 1 mA against a floor of a tenth of
- * that, so the phase number can be counted off the trace. Working the phase
- * boundaries out from the clock instead got them wrong once, and the last
- * phase puts the chip in deep sleep - after which its RAM, and any log in it,
- * is gone.
- *
- * Diagnostic scaffolding. Compiled out unless ATC_POWER_PROBE is set, and a
- * tag built with it stops advertising and ends up needing a power cycle.
- */
-#define ATC_PROBE_SECS 12u
-
-typedef struct {
-    uint8_t port;
-    uint8_t pin;
-} probe_pad;
-
-static const probe_pad probe_epd_pads[] = {
-    {EPD_SCLK_PORT, EPD_SCLK_PIN}, {EPD_MOSI_PORT, EPD_MOSI_PIN},
-    {EPD_CS_PORT, EPD_CS_PIN},     {EPD_DC_PORT, EPD_DC_PIN},
-    {EPD_RST_PORT, EPD_RST_PIN},   {EPD_BS_PORT, EPD_BS_PIN},
-    {EPD_PWR_PORT, EPD_PWR_PIN},   {EPD_BUSY_PORT, EPD_BUSY_PIN},
-};
-/* The lamp pads are never driven low here. They are active low - driving them
- * low lights the lamp, which showed up as 21.5 mA for a whole phase and said
- * nothing about the floor. Floating them is the only useful test.
- */
-static const probe_pad probe_lamp_pads[] = {
-    {LED_R_PORT, LED_R_PIN}, {LED_G_PORT, LED_G_PIN}, {LED_B_PORT, LED_B_PIN},
-    {LED_X_PORT, LED_X_PIN}, {LED_Y_PORT, LED_Y_PIN}, {LED_A_PORT, LED_A_PIN},
-    {LED_C_PORT, LED_C_PIN}, {LED_D_PORT, LED_D_PIN}, {LED_E_PORT, LED_E_PIN},
-    {LED_F_PORT, LED_F_PIN}, {LED_Z_PORT, LED_Z_PIN},
-};
-static const probe_pad probe_flash_pads[] = {
-    {FLASH_CLK_PORT, FLASH_CLK_PIN}, {FLASH_MOSI_PORT, FLASH_MOSI_PIN},
-    {FLASH_MISO_PORT, FLASH_MISO_PIN}, {FLASH_CS_PORT, FLASH_CS_PIN},
-};
-
-#define PROBE_N(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
-
-static uint8_t probe_phase;
-
-static void probe_mark(uint8_t n)
-{
-    uint8_t i;
-    uint16_t j;
-
-    for (i = 0; i < n; i++) {
-        for (j = 0; j < 100u; j++) {
-            arch_asm_delay_us(1000);
-        }
-    }
-    wdg_reload(WATCHDOG_DEFAULT_PERIOD);
-}
-
-static void probe_drive_low(const probe_pad *list, uint8_t n)
-{
-    uint8_t i;
-
-    for (i = 0; i < n; i++) {
-        GPIO_ConfigurePin((GPIO_PORT)list[i].port, (GPIO_PIN)list[i].pin,
-                          OUTPUT, PID_GPIO, false);
-        atc_pad_mode(list[i].port, list[i].pin, (unsigned)OUTPUT,
-                     (unsigned)PID_GPIO);
-        atc_pad_level(list[i].port, list[i].pin, 0);
-    }
-}
-
-static void probe_float(const probe_pad *list, uint8_t n)
-{
-    uint8_t i;
-
-    for (i = 0; i < n; i++) {
-        GPIO_ConfigurePin((GPIO_PORT)list[i].port, (GPIO_PIN)list[i].pin,
-                          INPUT, PID_GPIO, false);
-        atc_pad_mode(list[i].port, list[i].pin, (unsigned)INPUT,
-                     (unsigned)PID_GPIO);
-    }
-}
-
-static void probe_tick(void)
-{
-    wdg_reload(WATCHDOG_DEFAULT_PERIOD);
-    probe_phase++;
-    rtt_puts("probe phase ");
-    rtt_u32(probe_phase);
-    rtt_puts("\n");
-    probe_mark(probe_phase);
-    switch (probe_phase) {
-    case 1u:
-        /* The radio first, so the bursts leave the trace and every later step
-         * is read against a flat line.
-         */
-        probe_quiet = 1u;
-        if (atc_adv_timer != EASY_TIMER_INVALID_TIMER) {
-            app_easy_timer_cancel(atc_adv_timer);
-            atc_adv_timer = EASY_TIMER_INVALID_TIMER;
-        }
-        app_easy_gap_advertise_stop();
-        break;
-    case 2u:
-        /* Put the panel's chip-select and reset back to resting high, the way
-         * they were before panel_quiet() was changed. If driving a pad into
-         * an unpowered controller costs current, this is where it shows.
-         */
-        atc_pad_level(EPD_CS_PORT, EPD_CS_PIN, 1);
-        atc_pad_level(EPD_RST_PORT, EPD_RST_PIN, 1);
-        GPIO_ConfigurePin(EPD_CS_PORT, EPD_CS_PIN, OUTPUT, PID_GPIO, true);
-        GPIO_ConfigurePin(EPD_RST_PORT, EPD_RST_PIN, OUTPUT, PID_GPIO, true);
-        break;
-    case 3u:
-        /* And back to low, which should undo exactly phase 2. */
-        atc_pad_level(EPD_CS_PORT, EPD_CS_PIN, 0);
-        atc_pad_level(EPD_RST_PORT, EPD_RST_PIN, 0);
-        GPIO_ConfigurePin(EPD_CS_PORT, EPD_CS_PIN, OUTPUT, PID_GPIO, false);
-        GPIO_ConfigurePin(EPD_RST_PORT, EPD_RST_PIN, OUTPUT, PID_GPIO, false);
-        break;
-    case 4u:
-        /* Hand P1_4 and P1_5 back from the debug module and float them. */
-        SetBits16(SYS_CTRL_REG, DEBUGGER_ENABLE, 0);
-        GPIO_ConfigurePin(GPIO_PORT_1, GPIO_PIN_4, INPUT, PID_GPIO, false);
-        GPIO_ConfigurePin(GPIO_PORT_1, GPIO_PIN_5, INPUT, PID_GPIO, false);
-        atc_pad_mode(1u, 4u, (unsigned)INPUT, (unsigned)PID_GPIO);
-        atc_pad_mode(1u, 5u, (unsigned)INPUT, (unsigned)PID_GPIO);
-        break;
-    case 5u:
-        /* The whole SoC off. What the meter still reads is the rest of the
-         * board, and no firmware change gets below it.
-         */
-        rtt_puts("probe deep sleep\n");
-        arch_set_deep_sleep(false);
-        break;
-    default:
-        break;
-    }
-    if (probe_phase < 5u) {
-        atc_timer(ATC_PROBE_SECS * 100u, probe_tick);
-    }
-}
-
-static void probe_arm(void)
-{
-    static uint8_t armed;
-
-    if (armed == 0u) {
-        armed = 1u;
-        atc_timer(ATC_PROBE_SECS * 100u, probe_tick);
-    }
-}
-#endif /* ATC_POWER_PROBE */
-
 void user_advertise(void)
 {
     struct gapm_start_advertise_cmd *cmd;
@@ -3030,9 +3298,6 @@ void user_advertise(void)
         sense_armed = 1u;
         atc_timer(100, atc_sense_once);
     }
-#if ATC_POWER_PROBE
-    probe_arm();
-#endif
 }
 
 void user_on_dev_config(void)
@@ -3050,12 +3315,6 @@ void user_on_db_init(void)
 void user_on_adv_complete(const uint8_t status)
 {
     adv_on = 0;
-#if ATC_POWER_PROBE
-    if (probe_quiet) {
-        rtt_puts("probe radio off" "\n");
-        return;
-    }
-#endif
     rtt_puts("adv ");
     rtt_hex16(status);
     rtt_puts("\n");
@@ -3105,18 +3364,33 @@ void user_app_on_init(void)
             rtt_puts("unconfigured, waiting for 0004\n");
         }
     }
-    atc_session.capabilities = ATC_CAPABILITIES;
+    atc_session.capabilities = atc_capabilities();
+    wake_event(OEPL_WAKE_BOOT);
     atc_session.fw_version = ATC_FW_VERSION;
     led_apply();
     default_app_on_init();
     flash_bringup();
     {
-        uint8_t mark[8];
+        uint8_t mark[ATC_MARK_BYTES];
 
         if (flash_read(ATC_MARK_ADDR, mark, sizeof mark) == 0
-            && memcmp(mark, image_mark, sizeof mark) == 0) {
+            && memcmp(mark, image_mark, 6u) == 0
+            && (mark[6] == 1u || mark[6] == 2u)) {
             image_kept = 1u;
             rtt_puts("image kept\n");
+            if (mark[6] == 2u) {
+                uint64_t ver = 0;
+                uint8_t i;
+
+                for (i = 8u; i > 0u; i--) {
+                    ver = (uint64_t)((ver << 8) | mark[7u + i]);
+                }
+                if (ver != 0u) {
+                    atc_session.shown_ver = ver;
+                    atc_session.has_shown = 1;
+                    rtt_puts("image ver\n");
+                }
+            }
         }
     }
     ndef_load();
@@ -3137,6 +3411,16 @@ void user_on_connection(uint8_t connection_idx, struct gapc_connection_req_ind c
     rtt_puts("link up ");
     rtt_u32(param->con_interval);
     rtt_puts("\n");
+    /* Ask for long link-layer packets straight away.
+     *
+     * Without this a 233-byte picture part is nine 27-byte data channel
+     * PDUs, and with one or two of those per connection event a part takes
+     * about 195 ms however fast the interval is - measured on the bench:
+     * 4 s for a 4096-byte block, and neither a faster interval nor more
+     * parts in flight moved it. One PDU of 251 bytes carries a whole part.
+     */
+    app_easy_gap_set_data_packet_length(connection_idx, 251, 2120);
+    link_interval = param->con_interval;
     default_app_on_connection(connection_idx, param);
     /* Notifications stay armed for this link. A client that subscribes still
      * writes the same bit. One that misses the descriptor write would otherwise
@@ -3185,9 +3469,31 @@ void user_catch_rest_hndl(ke_msg_id_t const msgid,
     case CUSTS1_ATT_INFO_REQ:
         on_info((const struct custs1_att_info_req *)param, dest_id, src_id);
         break;
+    case GAPC_CMP_EVT: {
+        struct gapc_cmp_evt const *evt = (struct gapc_cmp_evt const *)param;
+
+        if (evt->operation == GAPC_SET_LE_PKT_SIZE) {
+            rtt_puts("dle req st ");
+            rtt_u32(evt->status);
+            rtt_puts("\n");
+        }
+        break;
+    }
+    case GAPC_LE_PKT_SIZE_IND: {
+        struct gapc_le_pkt_size_ind const *pkt = (struct gapc_le_pkt_size_ind const *)param;
+
+        link_tx_octets = pkt->max_tx_octets;
+        rtt_puts("dle tx ");
+        rtt_u32(pkt->max_tx_octets);
+        rtt_puts(" rx ");
+        rtt_u32(pkt->max_rx_octets);
+        rtt_puts("\n");
+        break;
+    }
     case GAPC_PARAM_UPDATED_IND: {
         struct gapc_param_updated_ind const *upd = (struct gapc_param_updated_ind const *)param;
 
+        link_interval = upd->con_interval;
         rtt_puts("link iv ");
         rtt_u32(upd->con_interval);
         rtt_puts(" to ");

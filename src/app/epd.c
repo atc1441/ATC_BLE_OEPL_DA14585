@@ -338,7 +338,11 @@ int epd_step(void)
         write_data(0xC7);
         write_data(0xC3);
         write_data(0xC0);
-        write_data(0x40);
+        /* The last booster byte is the one thing the two panels disagree on:
+         * 0x40 on the 7.5 inch glass, 0x80 on the 13.3 inch one. Both numbers
+         * are what the board's own stock firmware sends.
+         */
+        write_data(glass->boost);
         write_cmd(0x01);
         write_u16(glass_y1());
         write_data(0x00);

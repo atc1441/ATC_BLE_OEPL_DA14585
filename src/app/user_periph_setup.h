@@ -40,8 +40,6 @@
 #define LED_G_PIN        GPIO_PIN_5
 #define LED_B_PORT       GPIO_PORT_2
 #define LED_B_PIN        GPIO_PIN_9
-#define LED_X_PORT       GPIO_PORT_1
-#define LED_X_PIN        GPIO_PIN_2
 #define LED_Y_PORT       GPIO_PORT_1
 #define LED_Y_PIN        GPIO_PIN_3
 /* Further unused pads. Held high so a single active-low lamp on any of them
@@ -51,14 +49,26 @@
 #define LED_A_PIN        GPIO_PIN_4
 #define LED_C_PORT       GPIO_PORT_2
 #define LED_C_PIN        GPIO_PIN_4
-#define LED_D_PORT       GPIO_PORT_2
-#define LED_D_PIN        GPIO_PIN_6
-#define LED_E_PORT       GPIO_PORT_2
-#define LED_E_PIN        GPIO_PIN_7
-#define LED_F_PORT       GPIO_PORT_2
-#define LED_F_PIN        GPIO_PIN_8
 #define LED_Z_PORT       GPIO_PORT_3
 #define LED_Z_PIN        GPIO_PIN_0
+
+/* The NFC chip's bus. These four pads used to be in the lamp set, driven
+ * high so an unknown active-low lamp would be dark - which meant the
+ * firmware drove the whole bus push-pull and the chip never got a word in.
+ *
+ * SDA and SCL carry external pull-ups, so they idle as inputs and are only
+ * ever pulled down. CS has none and must be driven: high is the idle
+ * state, because the chip belongs to the reader whenever the MCU is not
+ * using it. IRQ is the chip's own output and is never driven.
+ */
+#define NFC_SDA_PORT     GPIO_PORT_2
+#define NFC_SDA_PIN      GPIO_PIN_7
+#define NFC_SCL_PORT     GPIO_PORT_2
+#define NFC_SCL_PIN      GPIO_PIN_8
+#define NFC_CS_PORT      GPIO_PORT_2
+#define NFC_CS_PIN       GPIO_PIN_6
+#define NFC_IRQ_PORT     GPIO_PORT_1
+#define NFC_IRQ_PIN      GPIO_PIN_2
 
 void GPIO_reservations(void);
 void set_pad_functions(void);

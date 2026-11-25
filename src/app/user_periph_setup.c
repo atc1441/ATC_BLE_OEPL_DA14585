@@ -164,14 +164,14 @@ void GPIO_reservations(void)
     RESERVE_GPIO(LED_R, LED_R_PORT, LED_R_PIN, PID_GPIO);
     RESERVE_GPIO(LED_G, LED_G_PORT, LED_G_PIN, PID_GPIO);
     RESERVE_GPIO(LED_B, LED_B_PORT, LED_B_PIN, PID_GPIO);
-    RESERVE_GPIO(LED_X, LED_X_PORT, LED_X_PIN, PID_GPIO);
     RESERVE_GPIO(LED_Y, LED_Y_PORT, LED_Y_PIN, PID_GPIO);
     RESERVE_GPIO(LED_A, LED_A_PORT, LED_A_PIN, PID_GPIO);
     RESERVE_GPIO(LED_C, LED_C_PORT, LED_C_PIN, PID_GPIO);
-    RESERVE_GPIO(LED_D, LED_D_PORT, LED_D_PIN, PID_GPIO);
-    RESERVE_GPIO(LED_E, LED_E_PORT, LED_E_PIN, PID_GPIO);
-    RESERVE_GPIO(LED_F, LED_F_PORT, LED_F_PIN, PID_GPIO);
     RESERVE_GPIO(LED_Z, LED_Z_PORT, LED_Z_PIN, PID_GPIO);
+    RESERVE_GPIO(NFC_SDA, NFC_SDA_PORT, NFC_SDA_PIN, PID_GPIO);
+    RESERVE_GPIO(NFC_SCL, NFC_SCL_PORT, NFC_SCL_PIN, PID_GPIO);
+    RESERVE_GPIO(NFC_CS, NFC_CS_PORT, NFC_CS_PIN, PID_GPIO);
+    RESERVE_GPIO(NFC_IRQ, NFC_IRQ_PORT, NFC_IRQ_PIN, PID_GPIO);
 }
 
 void set_pad_functions(void)
@@ -200,14 +200,19 @@ void set_pad_functions(void)
     pad_configure(LED_R_PORT, LED_R_PIN, OUTPUT, PID_GPIO, true);
     pad_configure(LED_G_PORT, LED_G_PIN, OUTPUT, PID_GPIO, true);
     pad_configure(LED_B_PORT, LED_B_PIN, OUTPUT, PID_GPIO, true);
-    pad_configure(LED_X_PORT, LED_X_PIN, OUTPUT, PID_GPIO, true);
     pad_configure(LED_Y_PORT, LED_Y_PIN, OUTPUT, PID_GPIO, true);
     pad_configure(LED_A_PORT, LED_A_PIN, OUTPUT, PID_GPIO, true);
     pad_configure(LED_C_PORT, LED_C_PIN, OUTPUT, PID_GPIO, true);
-    pad_configure(LED_D_PORT, LED_D_PIN, OUTPUT, PID_GPIO, true);
-    pad_configure(LED_E_PORT, LED_E_PIN, OUTPUT, PID_GPIO, true);
-    pad_configure(LED_F_PORT, LED_F_PIN, OUTPUT, PID_GPIO, true);
     pad_configure(LED_Z_PORT, LED_Z_PIN, OUTPUT, PID_GPIO, true);
+
+    /* The NFC bus idles with the chip handed to its radio side: CS high,
+     * both lines let go to their pull-ups, IRQ listened to and never
+     * driven. Driving SDA and SCL is what kept the chip silent before.
+     */
+    pad_configure(NFC_CS_PORT, NFC_CS_PIN, OUTPUT, PID_GPIO, true);
+    pad_configure(NFC_SDA_PORT, NFC_SDA_PIN, INPUT, PID_GPIO, false);
+    pad_configure(NFC_SCL_PORT, NFC_SCL_PIN, INPUT, PID_GPIO, false);
+    pad_configure(NFC_IRQ_PORT, NFC_IRQ_PIN, INPUT, PID_GPIO, false);
 }
 
 void periph_init(void)

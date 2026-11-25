@@ -242,6 +242,7 @@ def main():
             APP / "settings.c",
             APP / "epd.c",
             APP / "panel.c",
+            APP / "nfc.c",
             APP / "gui.c",
             OEPL / "oepl_session.c",
             OEPL / "oepl_inflate.c",
@@ -287,7 +288,11 @@ def main():
                # gap between the heap and the stack, which this image has been
                # running short of. The zlib picture path is not in that measurement,
                # which is why this is not cut further.
-               "-D__STACK_SIZE=0xC00", "-D__HEAP_SIZE=0x100", "-c", str(src), "-o", str(obj)]
+               #
+               # 0xA00 since the NFC driver went in: this image runs out of
+               # SysRAM, so its code counts against the same budget, and 2560
+               # bytes is still better than twice the measured peak.
+               "-D__STACK_SIZE=0xA00", "-D__HEAP_SIZE=0x100", "-c", str(src), "-o", str(obj)]
         done = subprocess.run(cmd, capture_output=True, text=True)
         if done.returncode != 0:
             sys.stderr.write(done.stderr)

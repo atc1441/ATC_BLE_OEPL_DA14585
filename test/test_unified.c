@@ -529,6 +529,7 @@ static void test_panel_limits(void)
     p.colors = 2u;
     p.driver = ATC_DRV_ZKC75S;
     p.caps = 0u;
+    p.boost = 0x40u;
     p.name = "test";
 
     p.width = 800u;
@@ -552,23 +553,65 @@ static void test_panel_limits(void)
     p.height = 0u;
     ok(!atc_panel_usable(&p), "zero height is refused");
 
-    /* The real ceiling: two 1-bit planes have to fit under the marker at
-     * 0x7F000. 880x528 does, which is why this build exists.
-     */
+    /* Two planes is what a picture costs, whatever the glass. */
     p.width = 880u;
     p.height = 528u;
-    ok(atc_panel_usable(&p), "880x528 two-plane fits the window");
-    ok(((uint32_t)880u * 528u / 8u) * 2u <= ATC_PANEL_WINDOW, "and the arithmetic agrees");
+    ok(atc_panel_image_size(&p) == 116160u, "880x528 is 116160 bytes a picture");
+    p.width = 960u;
+    p.height = 680u;
+    ok(atc_panel_image_size(&p) == 163200u, "960x680 is 163200");
 
-    /* Two planes of 1024x496 are 126976 bytes, which is the window exactly.
-     * That is the largest glass this flash layout can carry at full width.
+    /* Where that picture goes depends on the chip, not on a constant. The
+     * 512 KiB board keeps the window it has always had, and the 2 MiB board
+     * gets one at the top of its own flash.
+     */
+    {
+        uint32_t base = 0;
+        uint32_t end = 0;
+
+        p.width = 880u;
+        p.height = 528u;
+        ok(atc_panel_window(&p, 0x00080000u, &base, &end), "880x528 fits 512 KiB");
+        ok(base == 0x00060000u && end == 0x00080000u,
+           "and lands exactly where the 7.5 inch board has always had it");
+
+        p.width = 960u;
+        p.height = 680u;
+        ok(!atc_panel_window(&p, 0x00080000u, &base, &end),
+           "960x680 does not fit 512 KiB");
+        ok(base == 0 && end == 0, "and a refused window reports nothing");
+        ok(atc_panel_window(&p, 0x00200000u, &base, &end), "it fits 2 MiB");
+        ok(end == 0x00200000u, "the window ends at the top of the chip");
+        ok(base == 0x001D0000u, "and is three 64 KiB blocks long");
+        ok(end - base - ATC_PANEL_MARKER >= 163200u, "with room for the picture");
+        ok(base >= ATC_PANEL_LOW, "and never reaches into the reserved area");
+
+        /* Anything in between works the same way. */
+        ok(atc_panel_window(&p, 0x00100000u, &base, &end), "and 1 MiB too");
+        ok(end == 0x00100000u && base == 0x000D0000u, "window at the top of 1 MiB");
+
+        p.width = 880u;
+        p.height = 528u;
+        ok(atc_panel_window(&p, 0x00200000u, &base, &end), "the small glass on 2 MiB");
+        ok(end == 0x00200000u && base == 0x001E0000u, "takes the minimum 128 KiB");
+
+        /* A chip too small for anything at all. */
+        ok(!atc_panel_window(&p, 0x00040000u, &base, &end), "256 KiB is too small");
+        ok(!atc_panel_window(0, 0x00200000u, &base, &end), "null is refused");
+    }
+
+    /* The build-wide ceiling: a glass whose picture could not fit any of
+     * these boards is refused wherever it runs.
      */
     p.width = 1024u;
     p.height = 496u;
-    ok(((uint32_t)1024u * 496u / 8u) * 2u == ATC_PANEL_WINDOW, "1024x496 is the window exactly");
-    ok(atc_panel_usable(&p), "1024x496 two-plane fits");
-    p.height = 504u;
-    ok(!atc_panel_usable(&p), "eight rows more do not fit the picture window");
+    ok(atc_panel_usable(&p), "1024x496 is within the ceiling");
+    p.width = 1024u;
+    p.height = 6700u;
+    ok(atc_panel_image_size(&p) > ATC_PANEL_IMAGE_MAX, "1024x6700 is past the ceiling");
+    ok(!atc_panel_usable(&p), "and is refused");
+    p.width = 880u;
+    p.height = 528u;
 
     p.width = 880u;
     p.height = 528u;
@@ -578,6 +621,83 @@ static void test_panel_limits(void)
     p.colors = 0u;
     ok(!atc_panel_usable(&p), "zero colours is refused");
     ok(!atc_panel_usable(0), "null is refused");
+}
+
+/* The advertisement an access point parses, and the CRC both sides have to
+ * agree on. 0x313E is the CRC-16/CCITT-FALSE of eight zero bytes, which is
+ * what a tag showing nothing transferred reports; the access point gets
+ * there by running the same eight bytes through its own copy.
+ */
+static void test_adv_payload(void)
+{
+    uint8_t adv[31];
+    uint8_t scan[31];
+    uint8_t len;
+    static const uint8_t name[10] = {'A', 'T', 'C', '_', '2', '6', '0', 'B', 'E', '2'};
+
+    ok(oepl_crc16_ccitt((const uint8_t *)"", 0) == 0xFFFF, "an empty crc is the seed");
+    ok(oepl_image_crc(0) == 0x313E, "no image is 0x313E");
+    ok(oepl_image_crc(1) != 0x313E, "a real version is not");
+    ok(oepl_image_crc(0x0123456789ABCDEFull) == oepl_image_crc(0x0123456789ABCDEFull),
+       "the same version gives the same crc");
+    {
+        /* Little end first, which is the order the access point holds a
+         * dataVer in. A version of 1 must not hash like 1 << 56.
+         */
+        ok(oepl_image_crc(1) != oepl_image_crc(0x0100000000000000ull),
+           "the byte order is not symmetric");
+    }
+
+    ok(oepl_wake_byte(0, OEPL_WAKE_TIMED) == 0x00, "nothing to report");
+    ok(oepl_wake_byte(1, OEPL_WAKE_BOOT) == 0x11, "one boot");
+    ok(oepl_wake_byte(0x0F, OEPL_WAKE_WDT) == 0xFA, "counter and reason pack");
+    ok(oepl_wake_byte(0x1F, 0xFF) == 0xFF, "both halves are masked");
+
+    memset(adv, 0xAA, sizeof adv);
+    len = oepl_adv_payload(adv, sizeof adv, 0x0074, 0x0036, 0x0342,
+                           3250, 25, 7, 0x313E, 0x11);
+    ok(len == 18, "the record is 18 bytes");
+    ok(adv[0] == 17 && adv[1] == 0xFF, "a manufacturer record of 16 bytes");
+    ok(adv[2] == 0x37 && adv[3] == 0x13, "company 0x1337");
+    ok(adv[4] == 2, "layout version 2");
+    ok(adv[5] == 0x74 && adv[6] == 0x00, "hardware type");
+    ok(adv[7] == 0x36 && adv[8] == 0x00, "firmware version");
+    ok(adv[9] == 0x42 && adv[10] == 0x03, "capabilities, extension bit set");
+    ok((uint16_t)(adv[9] | (adv[10] << 8)) & OEPL_CAP_ADV_EXTENDED,
+       "and an access point can see it");
+    ok(adv[11] == (uint8_t)(3250u & 0xFF) && adv[12] == (uint8_t)(3250u >> 8), "battery");
+    ok((int8_t)adv[13] == 25, "temperature");
+    ok(adv[14] == 7, "counter");
+    ok(adv[15] == 0x3E && adv[16] == 0x31, "image crc, little end first");
+    ok(adv[17] == 0x11, "wake byte");
+    ok(adv[18] == 0xAA, "and nothing past it");
+
+    /* An access point that only knows version 2 reads the first 13 bytes of
+     * manufacturer data and must find exactly what it did before.
+     */
+    ok(adv[4] == 2 && adv[14] == 7, "the v2 fields are where they were");
+
+    ok(oepl_adv_payload(adv, 17, 0x0074, 1, 1, 1, 1, 1, 1, 1) == 0,
+       "a short buffer is refused");
+    ok(oepl_adv_payload(0, sizeof adv, 0x0074, 1, 1, 1, 1, 1, 1, 1) == 0,
+       "and so is no buffer");
+
+    memset(scan, 0xAA, sizeof scan);
+    len = oepl_scan_payload(scan, sizeof scan, name, sizeof name);
+    ok(len == 16, "the scan response is 16 bytes");
+    ok(scan[0] == 3 && scan[1] == 0x03 && scan[2] == 0x37 && scan[3] == 0x13,
+       "the service uuid");
+    ok(scan[4] == 11 && scan[5] == 0x09, "a complete local name of ten");
+    ok(memcmp(scan + 6, name, sizeof name) == 0, "the name itself");
+    ok(scan[16] == 0xAA, "and nothing past it");
+    ok(oepl_scan_payload(scan, 15, name, sizeof name) == 0, "a short buffer is refused");
+    ok(oepl_scan_payload(scan, sizeof scan, name, 0) == 0, "an empty name is refused");
+
+    /* Both together have to fit what the controller gives us: 31 bytes for
+     * the advertisement, three of which the stack spends on the flags.
+     */
+    ok(18 + 3 <= 31, "the advertisement fits with the flags");
+    ok(16 <= 31, "the scan response fits");
 }
 
 int main(void)
@@ -594,6 +714,7 @@ int main(void)
     test_settings_address();
     test_panel_catalog();
     test_panel_limits();
+    test_adv_payload();
 
     if (failures != 0) {
         printf("FAILED %d of %d checks\n", failures, checks);

@@ -11,11 +11,11 @@ including the SDK.
 | | |
 | --- | --- |
 | Target | Renesas DA14585, image runs from SysRAM, loaded from SPI flash by the ROM bootloader |
-| Advertised name | `ATC_` + the last three address octets, e.g. `ATC_279DFC` |
+| Advertised name | `ATC_` + the last three address octets, e.g. `ATC_279DFC`, in the scan response |
 | Service / characteristic | `0x1337` (both), on the Bluetooth base UUID |
-| Firmware version | `0x0030` (48) |
+| Firmware version | `0x0036` (54) |
 | Boards | One config per PCB: which glass, and whether the LED and NFC are fitted. Config `1` is the 7.5″ 880 × 528 black/white/red |
-| Firmware file | `firmware/ATC_OEPL_DA14585.bin`, 61 640 bytes |
+| Firmware file | `firmware/ATC_OEPL_DA14585.bin`, 64 080 bytes |
 | License | **GPL-3.0-or-later**; the bundled SDK keeps its own terms |
 
 ---
@@ -99,7 +99,7 @@ is staged in the picture window, a firmware update replaces the stored picture.
 | **Board config** | Which glass is fitted, and whether the PCB has the RGB LED and an NFC chip. Set once with `0x0004`, kept in flash |
 | **Status screen** | Drawn on every boot when no picture is stored: address, firmware version, panel, battery, temperature |
 | **RGB LED** | Steady colours and blink patterns, `0x0001` and `0x0015`, on the boards that have one fitted |
-| **NDEF store** | `0x0018`…`0x001D` store and return NDEF bytes. No NFC chip is driven on this board |
+| **NFC** | The PCB's NFC tag chip sits on the MCU's I2C bus, so a record sent to the tag is written into the chip as well and a phone held to the label reads it. Send one as a normal transfer of type `0xA0` (a type 2 TLV) or `0xA1` (a bare URL), or with `0x0018`…`0x001D`; the tag keeps its own copy in flash and `0x0019` returns it |
 | **PIN lock** | A RAM-only PIN that refuses every command but two while the tag is locked |
 | **Log stream** | `0x0022` pushes the tag's own debug output to the host as notifications |
 | **Sleep** | Extended sleep between advertisements, on by default. The advertising interval is 2 s and `0x0008` changes it |
@@ -172,8 +172,9 @@ same connector, the RGB LED fitted or not, an NFC chip or not. One row in
 
 | Config | Glass | Pixels | Colours | LED | NFC | |
 | --- | --- | --- | --- | --- | --- | --- |
-| `0` | — | — | — | — | — | **unconfigured**, where a freshly flashed tag starts |
-| `1` | ZKC75S, 7.5″ | 880 × 528 | black / white / red | yes | no | **verified on hardware** |
+| `0` | — | — | — | — | — | **unconfigured**, where a freshly flashed tag starts. Advertises hardware type `0xFA`, which an access point reads as config mode |
+| `1` | ZKC75S, 7.5″ | 880 × 528 | black / white / red | yes | yes | hardware type `0x73`. **Verified on hardware** |
+| `2` | ZKC133V-N, 13.3″ | 960 × 680 | black / white / red | no | yes | hardware type `0x74`, `tagtypes/74.json`. **Verified on hardware** |
 
 The id is big-endian in command `0x0004`:
 
@@ -182,6 +183,14 @@ The id is big-endian in command `0x0004`:
 00 04 00 00   -> back to unconfigured
 00 04 00 63   -> 0xFFFF, not a config this build carries
 ```
+
+An access point does the same thing its own way, and this firmware answers
+that too: an `AvailDataInfo` of type **`0xAF`** carries a command rather than
+data, and an argument of **`0xA0` + config id** selects a board — `0xA2` for
+the 13.3″ glass. Argument `0` reboots. That is the pairing that makes a tag
+usable from an access point without a word of configuration: an unconfigured
+tag advertises `0xFA`, the access point recognises config mode and offers the
+list, and the choice comes back as `0xAF` with `0xA0` + id.
 
 The geometry is read once at startup, so the tag stores the choice and restarts into
 it. Setting the config it already has is acknowledged **without** a reboot, so a host
@@ -195,6 +204,14 @@ a picture: there is no geometry to draw into, and writing a guessed size into an
 unknown panel is worse than writing nothing. Firmware updates and NDEF transfers are
 still accepted, so a tag can always be recovered over the air.
 
+**The picture window is worked out at boot**, not compiled in. The firmware reads the
+capacity out of the flash chip's JEDEC id and puts the window at the top of it, as
+many whole 64 KiB blocks as two planes and the marker sector need, never less than
+128 KiB and never reaching below `0x60000`. A 512 KiB board with the 7.5″ glass gets
+`0x60000`…`0x80000`, which is where that window has always been; a 2 MiB board with
+the 13.3″ glass gets `0x1D0000`…`0x200000`. A config whose picture will not fit the
+flash that is fitted is refused rather than stored.
+
 A board whose row does not carry the LED leaves those pads alone; `0x0001` and
 `0x0015` still acknowledge, so a host does not have to know which board it is talking
 to — there is simply nothing to light.
@@ -206,12 +223,17 @@ A glass on the same controller is one more row:
 ```c
 /* src/app/panel.c */
 static const atc_panel catalog[] = {
-    /* id   hw       w     h    col driver          caps                       name */
-    {   0u, 0x0000u,   0u,   0u, 0u, ATC_DRV_NONE,   0u,                        "unconfigured"   },
-    {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED,               "7.5 BWR ZKC75S" },
-    {   2u, 0x0036u, 800u, 480u, 1u, ATC_DRV_ZKC75S, ATC_CAP_LED | ATC_CAP_NFC, "7.5 BW"         },
+    /* id   hw       w     h    col driver          caps                       boost  name */
+    {   0u, 0x00FAu,   0u,   0u, 0u, ATC_DRV_NONE,   0u,                        0x00u, "unconfigured"       },
+    {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED | ATC_CAP_NFC, 0x40u, "7.5 BWR ZKC75S"     },
+    {   2u, 0x0074u, 960u, 680u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "13.3 BWR ZKC133V-N" },
 };
 ```
+
+`boost` is the last byte of the controller's `0x0C` booster soft start, the one
+number the two panels disagree on. An access point also needs a tag type file for a
+new glass: `tagtypes/74.json` here is the one for the 13.3″ board, and it belongs in
+the access point's `/tagtypes/` as `<hardware type>.json`.
 
 `caps` is what the PCB carries, not what the firmware can do: `ATC_CAP_LED`,
 `ATC_CAP_NFC`, or `0u` for a board with neither. `hw_type` is the hardware type that
@@ -223,6 +245,67 @@ width × height ≤ 507 904 pixels. A different controller needs its own source 
 driver id in `panel.h`, and `glass_ok()` in `src/app/epd.c` taught to accept it.
 
 ---
+
+## What the tag advertises
+
+Every advertisement carries one manufacturer record, company id `0x1337`, so an
+access point learns the state of a tag without connecting to it. 16 bytes, after
+the length and type bytes:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 2 | company id, `0x1337` |
+| 2 | 1 | layout version, `2` |
+| 3 | 2 | hardware type, or `0x00FA` while unconfigured |
+| 5 | 2 | firmware version |
+| 7 | 2 | capabilities |
+| 9 | 2 | battery, mV |
+| 11 | 1 | temperature, °C, signed |
+| 12 | 1 | a counter, one up per advertisement |
+| 13 | 2 | **CRC of the picture on the glass** |
+| 15 | 1 | **wake byte** |
+
+The last three bytes sit behind the version-2 layout rather than behind a version
+of their own: an access point dispatches on the version byte and refuses what it
+does not know, so a tag announcing version 3 would vanish from an older one
+instead of merely losing a field. Appended, an old access point copies its 13
+bytes and never looks further, and a newer one finds them because the record is
+longer and because capability bit `0x0200` says they are there.
+
+**The picture CRC** is CRC-16/CCITT-FALSE over the eight bytes of the `dataVer`
+that is on the glass, little end first. A tag showing nothing transferred reports
+`0x313E`, which is not a reserved value but simply the CRC of eight zero bytes;
+the access point arrives at the same number by running the same bytes through the
+same function.
+
+After a restart a configured tag reports `0x313E` again, and that is the truth
+rather than forgetfulness: it draws its status screen on every boot, so the
+transferred picture is no longer what is on the glass. The picture is still in
+flash and the next `0x0064` redraws it, which is exactly what an access point
+does when it sees this. The version is kept in the marker sector beside the
+picture, for the case where the tag comes up and does not redraw - an
+unconfigured one, which leaves the glass alone.
+
+**The wake byte** is an event counter in the top nibble and a reason in the
+bottom one: `0` nothing to report, `1` boot, `2` GPIO, `3` NFC, `4`–`6` buttons,
+`7` failed firmware, `8` first boot, `9` network scan, `10` watchdog. This tag
+reports `1` after every start and `0` once an access point has talked to it.
+A DA14585 has no reset-cause register — `0x50000304` is a DA14531 register and
+reads zero here — so a power-on, a commanded reboot and a watchdog reset are not
+told apart. The counter is what makes the byte usable from a passive scan: an
+advertisement cannot be acknowledged, so the reason stays standing until the next
+exchange clears it, and a receiver keeps the last byte it saw per tag and acts
+when it changes.
+
+Capabilities follow the board config: `0x0100` BLE and `0x0002` compression
+always, `0x0200` for the fields above, plus `0x0001` when the PCB has the LED and
+`0x0040` when it has the NFC chip.
+
+**The name is in the scan response**, not the advertisement: 16 bytes of
+manufacturer data and a ten character name are more than the 31 an advertisement
+holds. The scan response carries the service UUID `0x1337` and the name, which is
+where the reference firmware keeps it too — an active scan sees it, a passive one
+does not need it.
 
 ## Commands
 
@@ -240,7 +323,7 @@ implemented answers `0xFFFF`**, which is a normal answer and not a fault.
 | `0x0008` | Advertising period | `0x0063` | 0.625 ms slots, 100…10000, else 3200 |
 | `0x0009` | Set address | `0x0063` | Eight bytes. Stores and reboots |
 | `0x0011` | Dynamic read | `0x00CD` + 93 B | Geometry only |
-| `0x0014` | Deep sleep | `0x0063` | Refused while busy |
+| `0x0014` | Deep sleep | `0x0063` | Accepted and ignored; the tag does not sleep |
 | `0x0015` | Blink | `0x0063` | Twelve bytes: colour, on-time, counts |
 | `0x0016` | Status | `0x00D1` + 6 B | Battery, raw ADC, temperature |
 | `0x0017` | Reboot | `0x0063` | Refused while busy |
@@ -256,6 +339,13 @@ implemented answers `0xFFFF`**, which is a normal answer and not a fault.
 | `0x0023` | Sleep on / off | `0x0063` | Runtime switch, from RAM; a power cycle undoes it |
 | `0x0064` | AvailDataInfo | `0x00C6` | Starts a picture, firmware or NDEF transfer |
 | `0x0065` | Block part | `0x00C5` | One part of the current block |
+
+**The tag never goes into deep sleep.** `0x0014` is acknowledged so that an access
+point stops asking, and then ignored, because nothing on this board can wake the
+chip out of a deep sleep: the reset pin cannot restart a DA14585, so a tag that
+took the command came back only by losing power - which on a sealed label means
+opening it. `0x0017` reboots, and `0x0023` switches the sleep mode the tag uses
+while it runs.
 
 ### Transfers
 
@@ -348,10 +438,17 @@ payload against a DA14585 vector table — stack pointer inside
 | Panel DC | `P0_7` | | LED green | `P2_5` |
 | Panel RST | `P1_0` | | LED blue | `P2_9` |
 | Panel BUSY | `P1_1` | | SWD | `P1_4` clock, `P1_5` data |
+| NFC SDA | `P2_7` | | NFC CS | `P2_6`, active low |
+| NFC SCL | `P2_8` | | NFC IRQ | `P1_2` |
 
-`P1_2`, `P1_3`, `P0_4`, `P2_4`, `P2_6`, `P2_7`, `P2_8` and `P3_0` are held high; LED
-colour 7 drives them too. None of the LED pads is touched on a board whose config
-does not carry `ATC_CAP_LED`.
+The NFC chip's VCC is permanently on, so CS decides who has it: high, and the chip
+belongs to its radio side; low, and it answers the MCU while a reader gets no
+further than anticollision. So CS idles high and SDA and SCL idle as inputs on
+their pull-ups - driving them is what keeps the chip from ever answering.
+
+`P1_3`, `P0_4`, `P2_4` and `P3_0` are held high; LED colour 7 drives them too. None
+of the LED pads is touched on a board whose config does not carry `ATC_CAP_LED`,
+and the NFC bus is only used on a board whose config carries `ATC_CAP_NFC`.
 
 **Do not halt the core during a refresh.** The refresh clocks each plane through the
 GPIO registers: one step every 10 ms, up to 16 rows a step, the first step 100 ms

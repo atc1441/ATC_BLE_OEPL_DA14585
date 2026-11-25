@@ -20,6 +20,7 @@ void user_on_db_init(void);
 void user_on_adv_complete(const uint8_t status);
 void user_advertise(void);
 void user_on_update_params_rejected(const uint8_t status);
+void user_on_data_length_change(const uint8_t conidx, struct gapc_le_pkt_size_ind *ind);
 void user_on_update_params_complete(void);
 void user_before_sleep(void);
 sleep_mode_t user_validate_sleep(sleep_mode_t sleep_mode);
@@ -30,6 +31,7 @@ static const struct app_callbacks user_app_callbacks = {
     .app_on_disconnect                  = user_on_disconnect,
     .app_on_update_params_rejected      = user_on_update_params_rejected,
     .app_on_update_params_complete      = user_on_update_params_complete,
+    .app_on_data_length_change          = user_on_data_length_change,
     .app_on_set_dev_config_complete     = user_on_dev_config,
     .app_on_adv_nonconn_complete        = NULL,
     .app_on_adv_undirect_complete       = user_on_adv_complete,

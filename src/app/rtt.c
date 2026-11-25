@@ -23,7 +23,14 @@ typedef struct {
     rtt_buffer down[1];
 } rtt_control;
 
-static uint8_t up_storage[1024];
+/* 512 bytes, not 1024. This is the debug window a probe reads; the tag's
+ * own log stream keeps its own ring. Half a kilobyte of SysRAM is worth
+ * more to the picture path than twice the scrollback.
+ */
+/* 256: this is a debug log on a RAM-resident image, and the NFC driver
+ * needed the rest. Long lines are written in pieces anyway.
+ */
+static uint8_t up_storage[256];
 static uint8_t down_storage[16];
 
 rtt_control _SEGGER_RTT;

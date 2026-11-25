@@ -33,12 +33,6 @@
  */
 #define ATC_SLEEP_DEFAULT_ON 1
 
-/* Diagnostic scaffolding: a cumulative power staircase, see probe_tick().
- * Set to 1 only to attribute a sleep-current floor with a meter attached -
- * a tag built with it stops advertising eight seconds after boot.
- */
-#define ATC_POWER_PROBE 0
-
 #if ATC_SLEEP_DEFAULT_ON
 static const sleep_state_t app_default_sleep_mode = ARCH_EXT_SLEEP_ON;
 #else
@@ -61,21 +55,29 @@ static const struct advertise_configuration user_adv_conf = {
 };
 
 /* Placeholder for the version-2 manufacturer record, company id 0x1337.
- * user_advertise replaces it before the radio starts: hardware 0x0073,
- * firmware 0x0030, capabilities 0x01C3, then the live battery, temperature
- * and counter, plus the MAC name in the same packet. The stack adds the
- * flags. The device-name macro stays empty so a second name is rejected.
- * Scan response carries the 16-bit service UUID 0x1337.
+ * user_advertise replaces it before the radio starts: hardware type,
+ * firmware version, capabilities, then the live battery, temperature and
+ * counter, and behind those the CRC of the picture on the glass and the
+ * wake byte. 0x313E is the CRC of a dataVer of zero, which is what a tag
+ * showing nothing transferred sends, and 0x11 is one boot with nothing
+ * reported since. The stack adds the flags.
+ *
+ * The name is not in here: with 16 bytes of manufacturer data it would not
+ * fit in 31. It goes in the scan response, next to the service UUID, which
+ * is also where the reference firmware keeps it. The device-name macro
+ * stays empty so the stack does not add a second one.
  */
 #define USER_ADVERTISE_DATA \
-    "\x0E\xFF\x37\x13" \
+    "\x11\xFF\x37\x13" \
     "\x02" \
     "\x73\x00" \
     "\x30\x00" \
-    "\xC3\x01" \
+    "\x43\x03" \
     "\x00\x00" \
     "\x00" \
-    "\x00"
+    "\x00" \
+    "\x3E\x31" \
+    "\x11"
 #define USER_ADVERTISE_DATA_LEN     (sizeof(USER_ADVERTISE_DATA) - 1)
 #define USER_ADVERTISE_SCAN_RESPONSE_DATA     "\x03\x03\x37\x13"
 #define USER_ADVERTISE_SCAN_RESPONSE_DATA_LEN (sizeof(USER_ADVERTISE_SCAN_RESPONSE_DATA) - 1)

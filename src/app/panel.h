@@ -33,12 +33,29 @@
 #define ATC_CAP_LED 0x01u
 #define ATC_CAP_NFC 0x02u
 
-/* The picture window in SPI flash, 0x60000..0x7F000, is what a stored picture
- * has to fit in: the sector at 0x7F000 carries the ATCIMG marker. Two 1-bit
- * planes of w*h must stay under that, which is the real ceiling on how big a
- * glass this build can carry.
+/* The picture window is not a constant. These boards carry different flash -
+ * 512 KiB on the 7.5 inch one, 2 MiB on the 13.3 inch one - and a bigger
+ * glass needs a bigger window than a small chip has room for. So the window
+ * is worked out at boot from the size the chip reports in its JEDEC id and
+ * the size of one picture: it is the top of the flash, and the last 4 KiB
+ * sector of it holds the ATCIMG marker rather than picture data.
+ *
+ * Everything below ATC_PANEL_LOW is spoken for - bootloader, both boot
+ * slots, the product header, the pin record, the waveform, the NDEF sector
+ * and the settings record - so a window never starts under it.
  */
-#define ATC_PANEL_WINDOW 126976u
+#define ATC_PANEL_MARKER 4096u
+#define ATC_PANEL_LOW    0x00060000u
+#define ATC_PANEL_GRAIN  0x00010000u   /* windows are whole 64 KiB blocks */
+#define ATC_PANEL_MIN    0x00020000u   /* and at least 128 KiB, as before */
+
+/* The largest picture any board here could hold: a 2 MiB chip, everything
+ * below ATC_PANEL_LOW left alone, minus the marker sector. A row whose two
+ * planes are bigger than this is wrong on every board and is refused
+ * outright; whether it fits the chip actually fitted is a separate question
+ * that atc_panel_window() answers at boot.
+ */
+#define ATC_PANEL_IMAGE_MAX (0x00200000u - ATC_PANEL_LOW - ATC_PANEL_MARKER)
 
 /* One row is at most ATC_ROW_MAX bytes wide in the driver, so 1024 pixels. */
 #define ATC_PANEL_WIDTH_MAX 1024u
@@ -51,8 +68,19 @@ typedef struct atc_panel {
     uint8_t colors;
     uint8_t driver;
     uint8_t caps;         /* ATC_CAP_LED, ATC_CAP_NFC */
+    uint8_t boost;        /* last byte of the controller's 0x0C booster soft start */
     const char *name;
 } atc_panel;
+
+/* Two 1-bit planes of this glass, which is what one stored picture costs. */
+uint32_t atc_panel_image_size(const atc_panel *panel);
+
+/* Where the picture window lands on a chip of flash_bytes, as [base, end).
+ * 1 when it fits, 0 when the chip is too small for this glass - and then
+ * the row must not be selected, because a picture would have nowhere to go.
+ */
+int atc_panel_window(const atc_panel *panel, uint32_t flash_bytes,
+                     uint32_t *base, uint32_t *end);
 
 /* The row this run is on. Unconfigured until a stored config id replaces it
  * - see atc_panel_select(). Never null.

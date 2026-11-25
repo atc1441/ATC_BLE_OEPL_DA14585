@@ -1411,22 +1411,50 @@ static uint16_t reply_sysinfo(const oepl_session *session, uint8_t *rsp, uint16_
     return (uint16_t)(2u + (uint16_t)(q - rec));
 }
 
+uint16_t oepl_crc16_ccitt(const uint8_t *data, uint8_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    uint8_t b;
+
+    if (data == 0) {
+        return crc;
+    }
+    while (len-- != 0u) {
+        crc ^= (uint16_t)((uint16_t)*data++ << 8);
+        for (b = 0; b < 8u; b++) {
+            crc = (crc & 0x8000u) ? (uint16_t)((uint16_t)(crc << 1) ^ 0x1021u)
+                                  : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+uint16_t oepl_image_crc(uint64_t ver)
+{
+    uint8_t bytes[8];
+    uint8_t i;
+
+    for (i = 0; i < 8u; i++) {
+        bytes[i] = (uint8_t)(ver >> (8u * i));
+    }
+    return oepl_crc16_ccitt(bytes, 8u);
+}
+
+uint8_t oepl_wake_byte(uint8_t counter, uint8_t reason)
+{
+    return (uint8_t)(((uint8_t)(counter & 0x0Fu) << 4) | (uint8_t)(reason & 0x0Fu));
+}
+
 uint8_t oepl_adv_payload(uint8_t *dst, uint8_t cap,
                          uint16_t hw_type, uint16_t fw_version,
                          uint16_t capabilities, uint16_t battery_mv,
                          int8_t temperature, uint8_t counter,
-                         const uint8_t *name, uint8_t name_len)
+                         uint16_t img_crc, uint8_t wake_reason)
 {
-    uint8_t total;
-
-    if (dst == 0 || name == 0 || name_len == 0 || name_len > 18u) {
+    if (dst == 0 || cap < 18u) {
         return 0;
     }
-    total = (uint8_t)(17u + name_len);
-    if (cap < total) {
-        return 0;
-    }
-    dst[0] = 14;
+    dst[0] = 17;                 /* the type plus 16 bytes of manufacturer data */
     dst[1] = 0xFF;
     dst[2] = 0x37;
     dst[3] = 0x13;
@@ -1441,9 +1469,31 @@ uint8_t oepl_adv_payload(uint8_t *dst, uint8_t cap,
     dst[12] = (uint8_t)(battery_mv >> 8);
     dst[13] = (uint8_t)temperature;
     dst[14] = counter;
-    dst[15] = (uint8_t)(name_len + 1u);
-    dst[16] = 0x09;
-    memcpy(dst + 17, name, name_len);
+    dst[15] = (uint8_t)img_crc;
+    dst[16] = (uint8_t)(img_crc >> 8);
+    dst[17] = wake_reason;
+    return 18u;
+}
+
+uint8_t oepl_scan_payload(uint8_t *dst, uint8_t cap,
+                          const uint8_t *name, uint8_t name_len)
+{
+    uint8_t total;
+
+    if (dst == 0 || name == 0 || name_len == 0u || name_len > 18u) {
+        return 0;
+    }
+    total = (uint8_t)(6u + name_len);
+    if (cap < total) {
+        return 0;
+    }
+    dst[0] = 3;                  /* the 16-bit service UUID */
+    dst[1] = 0x03;
+    dst[2] = 0x37;
+    dst[3] = 0x13;
+    dst[4] = (uint8_t)(name_len + 1u);
+    dst[5] = 0x09;               /* the complete local name */
+    memcpy(dst + 6, name, name_len);
     return total;
 }
 
