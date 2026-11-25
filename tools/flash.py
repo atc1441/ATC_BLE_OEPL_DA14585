@@ -171,6 +171,17 @@ def write_bytes(jlink, addr, data):
     jlink.memory_write32(addr, words)
 
 
+def read_bytes(jlink, addr, length):
+    """Word reads, not byte reads - write_bytes' lesson, on the way back.
+
+    pylink's memory_read8 is one SWD access per byte, so reading a 63 KiB
+    image back was 64 512 of them. As 32-bit words it is one bulk transfer
+    per chunk, and the readback stops being a phase you wait for.
+    """
+    words = jlink.memory_read32(addr, (length + 3) // 4)
+    return b"".join(w.to_bytes(4, "little") for w in words)[:length]
+
+
 def run_mail(jlink, cmd, addr, length):
     words = [MAGIC, cmd, addr, length, BUF, 0, 0]
     jlink.halt()
@@ -293,6 +304,58 @@ def open_probe(serial):
     return jlink
 
 
+def program_pass(jlink, image, step):
+    """Erase, program and read the bank back. None when it matched,
+    otherwise the address where it did not.
+
+    step is how much goes into one mailbox call, and that is the whole
+    difference between a one minute flash and an eight minute one: a call
+    costs about a second of round trips whatever it carries, so 4096 bytes
+    at a time is 16 calls where 256 was 253. The stub splits each call into
+    the flash's own pages.
+    """
+    phase = time.time()
+    sector = BANK
+    end = BANK + len(image)
+    while sector < end:
+        run_mail(jlink, CMD_ERASE, sector, 0x1000)
+        sector += 0x1000
+    print("erased %u sectors in %.1f s"
+          % ((len(image) + 0xFFF) // 0x1000, time.time() - phase))
+
+    phase = time.time()
+    offset = 0
+    while offset < len(image):
+        chunk = image[offset:offset + step]
+        write_bytes(jlink, BUF, chunk)
+        run_mail(jlink, CMD_PROGRAM, BANK + offset, len(chunk))
+        offset += len(chunk)
+        # Re-assert the freeze and reload the counter as we go.
+        #
+        # One write at the start was not enough: this failed twice at the
+        # same point, about 8 KiB in, with the flasher no longer answering at
+        # all - which is what a reset mid-program looks like. SET_FREEZE_REG
+        # and WATCHDOG_REG both live in the peripheral domain, so anything
+        # that drops and re-raises that domain loses the freeze silently.
+        # Rewriting it costs one SWD write per chunk and removes the question.
+        jlink.memory_write16(WATCHDOG_REG, [0x00FF])
+        jlink.memory_write16(SET_FREEZE_REG, [FRZ_WDOG])
+    print("programmed %u bytes in %.1f s (wdog %d)"
+          % (len(image), time.time() - phase,
+             jlink.memory_read16(WATCHDOG_REG, 1)[0]))
+
+    phase = time.time()
+    offset = 0
+    while offset < len(image):
+        chunk = min(step, len(image) - offset)
+        run_mail(jlink, CMD_READ, BANK + offset, chunk)
+        if read_bytes(jlink, BUF, chunk) != image[offset:offset + chunk]:
+            return BANK + offset
+        offset += chunk
+    print("verify ok %u bytes in %.1f s" % (len(image), time.time() - phase))
+    return None
+
+
 def program(image, serial):
     jlink = open_probe(serial)
     try:
@@ -301,45 +364,15 @@ def program(image, serial):
         if jedec == 0 or jedec == 0xFFFFFF:
             raise SystemExit("flash id rejected")
 
-        sector = BANK
-        end = BANK + len(image)
-        while sector < end:
-            run_mail(jlink, CMD_ERASE, sector, 0x1000)
-            print("erased %05X" % sector)
-            sector += 0x1000
-
-        offset = 0
-        while offset < len(image):
-            page_off = (BANK + offset) & 0xFF
-            room = 256 - page_off
-            chunk = image[offset:offset + room]
-            write_bytes(jlink, BUF, chunk)
-            run_mail(jlink, CMD_PROGRAM, BANK + offset, len(chunk))
-            offset += len(chunk)
-            if offset % 4096 == 0 or offset == len(image):
-                # Re-assert the freeze and reload the counter as we go.
-                #
-                # One write at the start was not enough: this failed twice at
-                # the same point, about 8 KiB in, with the flasher no longer
-                # answering at all - which is what a reset mid-program looks
-                # like. SET_FREEZE_REG and WATCHDOG_REG both live in the
-                # peripheral domain, so anything that drops and re-raises that
-                # domain loses the freeze silently. Rewriting it every 4 KiB
-                # costs one SWD write per chunk and removes the question.
-                jlink.memory_write16(WATCHDOG_REG, [0x00FF])
-                jlink.memory_write16(SET_FREEZE_REG, [FRZ_WDOG])
-                print("programmed %u/%u (wdog %d)"
-                      % (offset, len(image), jlink.memory_read16(WATCHDOG_REG, 1)[0]))
-
-        offset = 0
-        while offset < len(image):
-            chunk = min(1024, len(image) - offset)
-            run_mail(jlink, CMD_READ, BANK + offset, chunk)
-            got = bytes(jlink.memory_read8(BUF, chunk))
-            if got != image[offset:offset + chunk]:
-                raise SystemExit("verify mismatch at %05X" % (BANK + offset))
-            offset += chunk
-        print("verify ok %u bytes" % len(image))
+        # Big calls first, pages if the readback ever disagrees.
+        for step in (4096, 256):
+            bad = program_pass(jlink, image, step)
+            if bad is None:
+                break
+            print("readback differs at %05X with %u-byte calls, going again"
+                  " in pages" % (bad, step))
+        else:
+            raise SystemExit("verify failed in pages as well")
 
         # Restart into the new image.
         #

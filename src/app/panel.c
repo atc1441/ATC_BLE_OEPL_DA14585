@@ -27,7 +27,7 @@
 static const atc_panel catalog[] = {
     /* id   hw       w     h    col driver          caps                       boost  name */
     {   0u, 0x00FAu,   0u,   0u, 0u, ATC_DRV_NONE,   0u,                        0x00u, "unconfigured"       },
-    {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED | ATC_CAP_NFC, 0x40u, "7.5 BWR ZKC75S"     },
+    {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED,               0x40u, "7.5 BWR ZKC75S"     },
     {   2u, 0x0074u, 960u, 680u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "13.3 BWR ZKC133V-N" },
 };
 

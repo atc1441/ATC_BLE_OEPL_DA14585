@@ -13,9 +13,8 @@ including the SDK.
 | Target | Renesas DA14585, image runs from SysRAM, loaded from SPI flash by the ROM bootloader |
 | Advertised name | `ATC_` + the last three address octets, e.g. `ATC_279DFC`, in the scan response |
 | Service / characteristic | `0x1337` (both), on the Bluetooth base UUID |
-| Firmware version | `0x0038` (56) |
 | Boards | One config per PCB: which glass, and whether the LED and NFC are fitted. Config `1` is the 7.5″ 880 × 528 black/white/red |
-| Firmware file | `firmware/ATC_OEPL_DA14585.bin`, 64 544 bytes |
+| Firmware file | `firmware/ATC_OEPL_DA14585.bin`, built by `tools/build.py`; the version it advertises is `ATC_FW_VERSION` in `src/app/user_atc.c` |
 | License | **GPL-3.0-or-later**; the bundled SDK keeps its own terms |
 
 ---
@@ -52,7 +51,8 @@ Commander prints.
 firmware hands those two pads back to the GPIO block **30 seconds after boot**, which
 is most of why an idle tag is quiet. A probe can only attach inside that window, so
 the sequence is: remove power, reapply it, flash. `ATC_SWD_GRACE_SECONDS` in
-`src/app/user_atc.c` sets the window.
+`src/app/user_atc.c` sets the window. A tag that still answers over BLE needs no
+power cycle for this: `0x0017` reboots it, which opens the same window.
 
 **Do it while the glass is idle.** The tool halts the core and loads a small flasher
 into RAM. A refresh, a picture erase or a firmware copy that is still running will be
@@ -130,11 +130,11 @@ which the build reads ahead of the bundled tree.
 | `build/atc_oepl.payload` | The bare payload, an intermediate. **Not** a firmware file — no header, and the bootloader refuses it |
 | `build/atc_oepl.elf` | The linked image, with `build/atc_oepl.map` |
 
-This tree links a 61 576-byte payload, so a 61 640-byte firmware file. Payload plus
-header has to fit the 102 400-byte application bank.
+The build prints the payload and firmware sizes it produced. Payload plus header
+has to fit the 102 400-byte application bank.
 
 ```sh
-python tools/test.py      # 184 checks: protocol, settings record, panel catalog
+python tools/test.py      # protocol, settings record, panel catalog
 ```
 
 Three modules build for the host as well as for the DA14585 — the protocol, the
@@ -173,7 +173,7 @@ same connector, the RGB LED fitted or not, an NFC chip or not. One row in
 | Config | Glass | Pixels | Colours | LED | NFC | |
 | --- | --- | --- | --- | --- | --- | --- |
 | `0` | — | — | — | — | — | **unconfigured**, where a freshly flashed tag starts. Advertises hardware type `0xFA`, which an access point reads as config mode |
-| `1` | ZKC75S, 7.5″ | 880 × 528 | black / white / red | yes | yes | hardware type `0x73`. **Verified on hardware** |
+| `1` | ZKC75S, 7.5″ | 880 × 528 | black / white / red | yes | no | hardware type `0x73`. **Verified on hardware** |
 | `2` | ZKC133V-N, 13.3″ | 960 × 680 | black / white / red | no | yes | hardware type `0x74`. **Verified on hardware** |
 
 The id is big-endian in command `0x0004`:
@@ -451,7 +451,9 @@ an input that is never driven; the tag watches it for a reader.
 
 `P1_3`, `P0_4`, `P2_4` and `P3_0` are held high; LED colour 7 drives them too. None
 of the LED pads is touched on a board whose config does not carry `ATC_CAP_LED`,
-and the NFC bus is only used on a board whose config carries `ATC_CAP_NFC`.
+and the NFC bus is only used on a board whose config carries `ATC_CAP_NFC` - without it
+all four of its pads are driven high instead, which is where they were before the
+bus existed.
 
 **Do not halt the core during a refresh.** The refresh clocks each plane through the
 GPIO registers: one step every 10 ms, up to 16 rows a step, the first step 100 ms

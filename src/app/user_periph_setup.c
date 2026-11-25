@@ -1,5 +1,6 @@
 #include "user_periph_setup.h"
 #include "datasheet.h"
+#include "panel.h"
 #include "user_atc.h"
 
 /* ---- the pad configuration, and why it is a table ------------------------
@@ -271,4 +272,21 @@ void periph_init(void)
      * it must never run inside the wake sequence.
      */
     atc_early_init();
+    /* The NFC bus on a board that has no chip on it.
+     *
+     * Which board this is cannot be known any earlier: the config comes
+     * out of the flash, and the flash cannot be read until the pads and
+     * the SPI clock are up. So all four pads are built ready for a chip
+     * above, and the three that idle as inputs are left with nothing on
+     * the other end on a board without one - a floating CMOS input is
+     * undefined and not free. Driven high is where they were before this
+     * bus existed: they were in the lamp set, and an unknown active-low
+     * lamp is dark that way.
+     */
+    if (!atc_panel_has(ATC_CAP_NFC)) {
+        pad_configure(NFC_CS_PORT, NFC_CS_PIN, OUTPUT, PID_GPIO, true);
+        pad_configure(NFC_SDA_PORT, NFC_SDA_PIN, OUTPUT, PID_GPIO, true);
+        pad_configure(NFC_SCL_PORT, NFC_SCL_PIN, OUTPUT, PID_GPIO, true);
+        pad_configure(NFC_IRQ_PORT, NFC_IRQ_PIN, OUTPUT, PID_GPIO, true);
+    }
 }

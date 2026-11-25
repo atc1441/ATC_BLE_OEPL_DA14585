@@ -193,7 +193,7 @@ static int in_bank(uint32_t addr, uint32_t len)
  */
 static int in_read(uint32_t addr, uint32_t len)
 {
-    if (len == 0 || len > 1024u || addr + len < addr) {
+    if (len == 0 || len > 4096u || addr + len < addr) {
         return 0;
     }
     if (in_bank(addr, len)) {
@@ -294,21 +294,45 @@ __attribute__((section(".text.flash_entry"), used, noreturn)) void flash_entry(v
             MAIL->status = wait_ready() == 0 ? ST_OK : ST_TIMEOUT;
         }
     } else if (local.cmd == CMD_PROGRAM) {
-        if (!in_bank(local.addr, local.len) || local.len > 256u
-            || ((local.addr & 0xFFu) + local.len) > 256u) {
+        /* Up to 4096 bytes, split into the flash's 256-byte pages here
+         * rather than by the host.
+         *
+         * A page is all the flash takes in one program command, but one
+         * page per mailbox call made the host pay a round trip for each,
+         * about a second measured - most of the eight minutes a bank used
+         * to take. This is the same work, in one call.
+         */
+        if (!in_bank(local.addr, local.len) || local.len > 4096u) {
             MAIL->status = ST_RANGE;
-        } else if (wait_ready() != 0) {
-            MAIL->status = ST_TIMEOUT;
         } else {
             const uint8_t *src = (const uint8_t *)local.buf;
-            wren();
-            cs_begin();
-            cmd_addr(0x02, local.addr);
-            for (i = 0; i < local.len; i++) {
-                xfer(src[i]);
+            uint32_t done = 0u;
+
+            MAIL->status = ST_OK;
+            while (done < local.len) {
+                uint32_t page = 256u - ((local.addr + done) & 0xFFu);
+                uint32_t left = local.len - done;
+
+                if (page > left) {
+                    page = left;
+                }
+                if (wait_ready() != 0) {
+                    MAIL->status = ST_TIMEOUT;
+                    break;
+                }
+                wren();
+                cs_begin();
+                cmd_addr(0x02, local.addr + done);
+                for (i = 0; i < page; i++) {
+                    xfer(src[done + i]);
+                }
+                cs_end();
+                if (wait_ready() != 0) {
+                    MAIL->status = ST_TIMEOUT;
+                    break;
+                }
+                done += page;
             }
-            cs_end();
-            MAIL->status = wait_ready() == 0 ? ST_OK : ST_TIMEOUT;
         }
     } else if (local.cmd == CMD_READ) {
         uint8_t *dst = (uint8_t *)local.buf;
