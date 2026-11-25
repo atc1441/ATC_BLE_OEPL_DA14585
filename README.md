@@ -13,9 +13,9 @@ including the SDK.
 | Target | Renesas DA14585, image runs from SysRAM, loaded from SPI flash by the ROM bootloader |
 | Advertised name | `ATC_` + the last three address octets, e.g. `ATC_279DFC`, in the scan response |
 | Service / characteristic | `0x1337` (both), on the Bluetooth base UUID |
-| Firmware version | `0x0036` (54) |
+| Firmware version | `0x0038` (56) |
 | Boards | One config per PCB: which glass, and whether the LED and NFC are fitted. Config `1` is the 7.5″ 880 × 528 black/white/red |
-| Firmware file | `firmware/ATC_OEPL_DA14585.bin`, 64 080 bytes |
+| Firmware file | `firmware/ATC_OEPL_DA14585.bin`, 64 544 bytes |
 | License | **GPL-3.0-or-later**; the bundled SDK keeps its own terms |
 
 ---
@@ -99,7 +99,7 @@ is staged in the picture window, a firmware update replaces the stored picture.
 | **Board config** | Which glass is fitted, and whether the PCB has the RGB LED and an NFC chip. Set once with `0x0004`, kept in flash |
 | **Status screen** | Drawn on every boot when no picture is stored: address, firmware version, panel, battery, temperature |
 | **RGB LED** | Steady colours and blink patterns, `0x0001` and `0x0015`, on the boards that have one fitted |
-| **NFC** | The PCB's NFC tag chip sits on the MCU's I2C bus, so a record sent to the tag is written into the chip as well and a phone held to the label reads it. Send one as a normal transfer of type `0xA0` (a type 2 TLV) or `0xA1` (a bare URL), or with `0x0018`…`0x001D`; the tag keeps its own copy in flash and `0x0019` returns it |
+| **NFC** | The PCB's NFC tag chip sits on the MCU's I2C bus, so a record sent to the tag is written into the chip as well and a phone held to the label reads it. Send one as a normal transfer of type `0xA0` (a type 2 TLV) or `0xA1` (a bare URL), or with `0x0018`…`0x001D`; the tag keeps its own copy in flash and `0x0019` returns it. The chip's IRQ line is watched too, so a reader held to the label shows up in the advertisement as wake reason `3` |
 | **PIN lock** | A RAM-only PIN that refuses every command but two while the tag is locked |
 | **Log stream** | `0x0022` pushes the tag's own debug output to the host as notifications |
 | **Sleep** | Extended sleep between advertisements, on by default. The advertising interval is 2 s and `0x0008` changes it |
@@ -174,7 +174,7 @@ same connector, the RGB LED fitted or not, an NFC chip or not. One row in
 | --- | --- | --- | --- | --- | --- | --- |
 | `0` | — | — | — | — | — | **unconfigured**, where a freshly flashed tag starts. Advertises hardware type `0xFA`, which an access point reads as config mode |
 | `1` | ZKC75S, 7.5″ | 880 × 528 | black / white / red | yes | yes | hardware type `0x73`. **Verified on hardware** |
-| `2` | ZKC133V-N, 13.3″ | 960 × 680 | black / white / red | no | yes | hardware type `0x74`, `tagtypes/74.json`. **Verified on hardware** |
+| `2` | ZKC133V-N, 13.3″ | 960 × 680 | black / white / red | no | yes | hardware type `0x74`. **Verified on hardware** |
 
 The id is big-endian in command `0x0004`:
 
@@ -232,8 +232,8 @@ static const atc_panel catalog[] = {
 
 `boost` is the last byte of the controller's `0x0C` booster soft start, the one
 number the two panels disagree on. An access point also needs a tag type file for a
-new glass: `tagtypes/74.json` here is the one for the 13.3″ board, and it belongs in
-the access point's `/tagtypes/` as `<hardware type>.json`.
+new glass, `<hardware type>.json` in its own `/tagtypes/`; that file belongs to the
+access point, not here.
 
 `caps` is what the PCB carries, not what the firmware can do: `ATC_CAP_LED`,
 `ATC_CAP_NFC`, or `0u` for a board with neither. `hw_type` is the hardware type that
@@ -289,17 +289,19 @@ unconfigured one, which leaves the glass alone.
 **The wake byte** is an event counter in the top nibble and a reason in the
 bottom one: `0` nothing to report, `1` boot, `2` GPIO, `3` NFC, `4`–`6` buttons,
 `7` failed firmware, `8` first boot, `9` network scan, `10` watchdog. This tag
-reports `1` after every start and `0` once an access point has talked to it.
-A DA14585 has no reset-cause register — `0x50000304` is a DA14531 register and
-reads zero here — so a power-on, a commanded reboot and a watchdog reset are not
-told apart. The counter is what makes the byte usable from a passive scan: an
-advertisement cannot be acknowledged, so the reason stays standing until the next
-exchange clears it, and a receiver keeps the last byte it saw per tag and acts
-when it changes.
+reports `1` after a start, and `3` when a reader has been at the label — including
+when a reader is what started it. A DA14585 has no reset-cause register, so a
+power-on, a commanded reboot and a watchdog reset are not told apart.
+
+The counter is what makes the byte usable from a passive scan: an advertisement
+cannot be acknowledged, so the reason stays standing until somebody connects, and
+a receiver keeps the last byte it saw per tag and acts when it changes. A
+connection clears both halves back to zero, and so does the `0x0064` that brings
+a picture, since that arrives over one.
 
 Capabilities follow the board config: `0x0100` BLE and `0x0002` compression
 always, `0x0200` for the fields above, plus `0x0001` when the PCB has the LED and
-`0x0040` when it has the NFC chip.
+`0x0040` with `0x0080` when it has the NFC chip.
 
 **The name is in the scan response**, not the advertisement: 16 bytes of
 manufacturer data and a ten character name are more than the 31 an advertisement
@@ -444,7 +446,8 @@ payload against a DA14585 vector table — stack pointer inside
 The NFC chip's VCC is permanently on, so CS decides who has it: high, and the chip
 belongs to its radio side; low, and it answers the MCU while a reader gets no
 further than anticollision. So CS idles high and SDA and SCL idle as inputs on
-their pull-ups - driving them is what keeps the chip from ever answering.
+their pull-ups - driving them is what keeps the chip from ever answering. IRQ is
+an input that is never driven; the tag watches it for a reader.
 
 `P1_3`, `P0_4`, `P2_4` and `P3_0` are held high; LED colour 7 drives them too. None
 of the LED pads is touched on a board whose config does not carry `ATC_CAP_LED`,

@@ -177,6 +177,12 @@ def cflags(includes):
         "-Wno-address-of-packed-member",
         "-Wno-maybe-uninitialized",
         "-D__DA14585__",
+        # The tag watches its NFC chip's IRQ line through the wakeup
+        # controller and brings its own four line interrupt handler for it,
+        # in user_atc.c. The SDK's handler also serves a quadrature decoder
+        # this board has no pins for, and that is 300 bytes of an image
+        # which runs out of SysRAM.
+        "-D__EXCLUDE_WKUP_QUADEC_HANDLER__",
         "-include",
         "da1458x_config_basic.h",
         "-include",
@@ -292,7 +298,13 @@ def main():
                # 0xA00 since the NFC driver went in: this image runs out of
                # SysRAM, so its code counts against the same budget, and 2560
                # bytes is still better than twice the measured peak.
-               "-D__STACK_SIZE=0xA00", "-D__HEAP_SIZE=0x100", "-c", str(src), "-o", str(obj)]
+               #
+               # 0x900 since the tag watches its NFC chip's IRQ line: the
+               # watch and the deferred message it posts are another 432
+               # bytes of code out of the same budget. Still more than twice
+               # the measured peak, with 252 bytes left between the heap and
+               # the stack.
+               "-D__STACK_SIZE=0x900", "-D__HEAP_SIZE=0x100", "-c", str(src), "-o", str(obj)]
         done = subprocess.run(cmd, capture_output=True, text=True)
         if done.returncode != 0:
             sys.stderr.write(done.stderr)

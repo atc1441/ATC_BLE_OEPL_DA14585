@@ -2,6 +2,7 @@
 
 #include "adc.h"
 #include "app_api.h"
+#include "app_easy_msg_utils.h"
 #include "app_easy_timer.h"
 #include "arch.h"
 #include "arch_api.h"
@@ -109,14 +110,14 @@ static uint16_t atc_capabilities(void)
         caps |= OEPL_CAP_LED;
     }
     if (atc_panel_has(ATC_CAP_NFC)) {
-        caps |= OEPL_CAP_NFC;
+        caps |= OEPL_CAP_NFC | OEPL_CAP_NFC_WAKE;
     }
     return caps;
 }
 /* Little-endian on the air: bytes 0x31, 0x00. Decimal 49. The access point
  * turns on zlib images once a tag reports a version of 0x27 or higher.
  */
-#define ATC_FW_VERSION    0x0036u
+#define ATC_FW_VERSION    0x0038u
 
 extern struct bd_addr dev_bdaddr;
 
@@ -157,7 +158,7 @@ static void image_erase_tick(void);
  * the reason long before the builder down the file reads it.
  */
 static void wake_event(uint8_t reason);
-static void wake_timed(void);
+static void wake_clear(void);
 static void store_arm(uint16_t delay);
 /* The marker sector: six bytes of name, a layout number, a zero, and then
  * the eight bytes of the dataVer that is on the glass.
@@ -2681,10 +2682,11 @@ static void on_write(const struct custs1_val_write_ind *ind)
     if (cmd == OEPL_CMD_AVAIL && ind->length >= 2u) {
         const uint8_t *body = ind->value + 2;
         /* An access point has this tag on the line, so whatever the wake
-         * byte was reporting has been delivered. The counter stays where it
-         * is: this is the absence of an event.
+         * byte was reporting has been delivered. Here as well as on the
+         * connection itself, for an event that happens while the link is
+         * up.
          */
-        wake_timed();
+        wake_clear();
         uint16_t body_len = (uint16_t)(ind->length - 2u);
         uint8_t type = 0u;
         uint8_t arg = 0u;
@@ -3111,9 +3113,8 @@ static void atc_mac_name(uint8_t name[10])
  *
  * The counter is what makes the byte readable without a connection. An
  * advertisement cannot be acknowledged, so the reason stays standing until
- * the next exchange clears it; a receiver keeps the last byte it saw per tag
- * and acts when it changes. Which is also why clearing the reason must not
- * move the counter - that is the absence of an event, not one.
+ * somebody connects; a receiver keeps the last byte it saw per tag and
+ * acts when it changes.
  */
 static uint8_t wake_counter;
 static uint8_t wake_reason = OEPL_WAKE_BOOT;
@@ -3124,8 +3125,22 @@ static void wake_event(uint8_t reason)
     wake_reason = reason;
 }
 
-static void wake_timed(void)
+/* Nothing to report, counter and all.
+ *
+ * Both halves go to zero together. The event has been delivered by the
+ * time an access point is on the line, and a byte reading "nothing to
+ * report" with the counter beside it still standing at four invites a
+ * receiver to believe something happened.
+ *
+ * What it costs: a receiver that misses the cleared byte reads the next
+ * event as no change, because the counter starts again from the same
+ * place. Cheap, because unlike an event the cleared byte is not a
+ * moment - it is what the tag advertises from then until something
+ * happens, so there is no missing it.
+ */
+static void wake_clear(void)
 {
+    wake_counter = 0u;
     wake_reason = OEPL_WAKE_TIMED;
 }
 
@@ -3150,6 +3165,191 @@ static void atc_load_adv(uint8_t *adv, uint8_t *adv_len, uint8_t *scan, uint8_t 
 
 void user_advertise(void);
 
+/* Put the current numbers on the air now.
+ *
+ * Nothing to do while a link is up: the radio is not advertising, and
+ * what is loaded here would be stale by the time it starts again - the
+ * tick reloads it then.
+ */
+static void adv_push(void)
+{
+    uint8_t adv[ADV_DATA_LEN];
+    uint8_t scan[SCAN_RSP_DATA_LEN];
+    uint8_t adv_len = 0;
+    uint8_t scan_len = 0;
+
+    if (atc_connected || !adv_on) {
+        return;
+    }
+    atc_load_adv(adv, &adv_len, scan, &scan_len);
+    if (adv_len != 0) {
+        app_easy_gap_update_adv_data(adv, adv_len, scan, scan_len);
+    }
+}
+
+/* A reader at the glass, reported once.
+ *
+ * The chip's IRQ line is the only thing on this board that can say a
+ * reader is there - the chip answers it by itself and reports nothing
+ * else. The line is watched by the wakeup controller rather than
+ * polled: it counts edges in hardware, so this costs nothing while
+ * nobody taps, and the tag keeps its ten second idle tick instead of
+ * waking fast enough to catch one.
+ *
+ * The line idles high and an assertion pulls it down: measured on the
+ * board, P1_2 sits high with no pull of its own, so the chip holds it
+ * there. That is a constant here now. It used to be sampled at startup
+ * and the watch armed for whichever way the pin happened to sit, which
+ * looked like the robust choice and was upside down in the one case that
+ * matters: a tag a reader has just started has its line down already, so
+ * the sample said "idles low", the watch went on the rising edge, and
+ * from then on the tag reported readers leaving instead of arriving.
+ *
+ * Which is also how the tag knows why it came up. A line that is down
+ * while the firmware is still starting is a reader standing in the field,
+ * and on this board that is what started it - so the first thing it
+ * advertises is NFC rather than boot.
+ *
+ * One visit is one event. A reader does not have to tap - left lying on
+ * the glass it radiates without pause, and the line may well move for
+ * every frame it sends - so after an event the watch is left off for
+ * ATC_NFC_QUIET_SECONDS and the tick arms it again. Without that floor
+ * the four bit counter in the advertisement wraps while the phone is
+ * still being held there, and a receiver that acts on the counter
+ * moving cannot tell one visit from the next.
+ */
+#define ATC_NFC_QUIET_SECONDS 20u
+
+static uint8_t nfc_irq_watch;
+/* Set in the interrupt, taken by whoever gets there first. */
+static volatile uint8_t nfc_irq_hit;
+static uint16_t nfc_irq_quiet;
+
+#if NFC_IRQ_PORT != GPIO_PORT_1
+#error "the watch below writes the port 1 wakeup registers"
+#endif
+
+/* The wakeup controller, written to rather than driven.
+ *
+ * Its SDK driver costs 398 bytes, and 216 of those are a handler that
+ * also carries the quadrature decoder this board has no pins for and a
+ * clock restore that only an image which sleeps needs. This one does the
+ * same six writes, which in an image running out of SysRAM is 300 bytes
+ * of stack kept.
+ */
+static void nfc_irq_arm(void)
+{
+    SetBits16(CLK_PER_REG, WAKEUPCT_ENABLE, 1);
+    SetWord16(WKUP_SELECT_P1_REG, 1u << NFC_IRQ_PIN);
+    SetWord16(WKUP_POL_P1_REG, 1u << NFC_IRQ_PIN);   /* the falling edge */
+    /* One event is a visit. No debouncing: nothing here knows how short
+     * an assertion can be, so a debouncer would only decide which taps
+     * to miss. The quiet window above is what keeps the rate down.
+     */
+    SetWord16(WKUP_COMPARE_REG, 1u);
+    SetWord16(WKUP_RESET_IRQ_REG, 1u);
+    SetWord16(WKUP_RESET_CNTR_REG, 0u);
+    SetWord16(WKUP_CTRL_REG, WKUP_ENABLE_IRQ);
+    /* Priority 2, the same one the SDK's driver gives this interrupt.
+     * The default is 0, which would let a tap cut into the stack's own
+     * interrupts to post a kernel message.
+     */
+    NVIC_SetPriority(WKUP_QUADEC_IRQn, 2);
+    NVIC_EnableIRQ(WKUP_QUADEC_IRQn);
+}
+
+/* Kernel context: take the flag the interrupt set, at most once.
+ *
+ * Reached two ways on purpose. The message app_easy_wakeup() posts gets
+ * here within a kernel turn, which is what makes a tap show up while the
+ * phone is still at the glass; the tick calls it as well, because
+ * extended sleep is a mode this firmware can be put into and a message
+ * posted on the way out of it depends on the BLE core coming back for
+ * it. Whichever arrives first does the work and clears the flag.
+ */
+static void nfc_irq_take(void)
+{
+    if (!nfc_irq_hit) {
+        return;
+    }
+    nfc_irq_hit = 0u;
+    nfc_irq_quiet = ATC_NFC_QUIET_SECONDS;
+    /* Not a reader: the MCU has the chip and is writing the record
+     * into it, and CS moving is not somebody tapping.
+     */
+    if (nfc_on) {
+        return;
+    }
+    wake_event(OEPL_WAKE_NFC);
+    rtt_puts("nfc tap\n");
+    /* On the air now. The advertisement is otherwise rewritten once a
+     * minute, and a tap is only worth reporting while whoever tapped
+     * is still standing there.
+     */
+    adv_push();
+}
+
+/* The controller's interrupt, in place of the SDK's handler for it.
+ *
+ * Acknowledge, switch this interrupt off - it stays off until the tick
+ * arms it again, which is the whole rate limit - then record that it
+ * happened and ask the kernel for a turn. Both of those are safe from
+ * here: one byte, and a message.
+ *
+ * The registers written here are in the always-on block, so this is
+ * sound even when the interrupt is what is bringing the chip out of
+ * extended sleep with the peripheral domain still down.
+ */
+void WKUP_QUADEC_Handler(void)
+{
+    SetWord16(WKUP_RESET_IRQ_REG, 1u);
+    SetBits16(WKUP_CTRL_REG, WKUP_ENABLE_IRQ, 0);
+    nfc_irq_hit = 1u;
+    app_easy_wakeup();
+}
+
+/* Idle, i.e. nobody at the glass. */
+static uint8_t nfc_irq_idle(void)
+{
+    return GPIO_GetPinStatus(NFC_IRQ_PORT, NFC_IRQ_PIN) ? 1u : 0u;
+}
+
+/* Arm, but only with the line back up.
+ *
+ * Arming against a line that is already down is either pointless - the
+ * edge has been and gone, and the reader holding it there is the visit
+ * just reported - or, on a board whose line sits down, a visit reported
+ * every time the window expires. The tick tries again.
+ */
+static void nfc_irq_rearm(void)
+{
+    if (nfc_irq_idle()) {
+        nfc_irq_arm();
+    }
+}
+
+static void nfc_irq_init(void)
+{
+    if (!atc_panel_has(ATC_CAP_NFC)) {
+        return;
+    }
+    nfc_irq_watch = 1u;
+    app_easy_wakeup_set(nfc_irq_take);
+    if (!nfc_irq_idle()) {
+        /* Down before the tag has finished starting: a reader is in the
+         * field, and on this board that is what started it. The same
+         * single event the boot already counted, named for what caused
+         * it - so the reason is replaced and the counter left alone.
+         */
+        wake_reason = OEPL_WAKE_NFC;
+        nfc_irq_quiet = ATC_NFC_QUIET_SECONDS;
+        rtt_puts("nfc start\n");
+        return;
+    }
+    nfc_irq_arm();
+    rtt_puts("nfc watch on\n");
+}
+
 /* Two seconds while there is work to pump, ten when there is not.
  *
  * Re-arming at 2 s unconditionally gave an idle tag a second wake on top of
@@ -3173,10 +3373,6 @@ static uint32_t atc_tick_delay(void)
 
 static void atc_adv_tick(void)
 {
-    uint8_t adv[ADV_DATA_LEN];
-    uint8_t scan[SCAN_RSP_DATA_LEN];
-    uint8_t adv_len = 0;
-    uint8_t scan_len = 0;
     uint32_t tick_seconds = atc_tick_delay() / 100u;
 
     atc_adv_timer = EASY_TIMER_INVALID_TIMER;
@@ -3211,6 +3407,23 @@ static void atc_adv_tick(void)
         rtt_puts("\n");
     }
     oepl_pin_tick(&atc_session, (uint16_t)tick_seconds);
+    if (nfc_irq_watch) {
+        /* Before the window is counted, so a tap the message did not
+         * carry is still reported rather than aged out.
+         */
+        nfc_irq_take();
+        if (nfc_irq_quiet > tick_seconds) {
+            nfc_irq_quiet = (uint16_t)(nfc_irq_quiet - tick_seconds);
+        } else {
+            /* Armed again, every tick rather than only on the way out
+             * of the quiet window: arming is a handful of register
+             * writes, and doing it unconditionally means a lost
+             * message cannot leave the line unwatched for good.
+             */
+            nfc_irq_quiet = 0u;
+            nfc_irq_rearm();
+        }
+    }
     swd_release((uint16_t)tick_seconds);
     if (atc_session.log_stream && log_timer == EASY_TIMER_INVALID_TIMER) {
         log_step();
@@ -3237,10 +3450,7 @@ static void atc_adv_tick(void)
              * advertisement on every tick meant a GAPM round trip, and the
              * payload it carried was the same numbers again.
              */
-            atc_load_adv(adv, &adv_len, scan, &scan_len);
-            if (adv_len != 0) {
-                app_easy_gap_update_adv_data(adv, adv_len, scan, scan_len);
-            }
+            adv_push();
         } else {
             sense_countdown = (uint16_t)(sense_countdown - tick_seconds);
         }
@@ -3394,12 +3604,17 @@ void user_app_on_init(void)
         }
     }
     ndef_load();
+    nfc_irq_init();
 }
 
 void user_on_connection(uint8_t connection_idx, struct gapc_connection_req_ind const *param)
 {
     atc_conidx = connection_idx;
     atc_connected = 1;
+    /* Somebody is on the line: whatever the wake byte was reporting has
+     * arrived, picture or no picture.
+     */
+    wake_clear();
     adv_on = 0;
     link_mode = 0;
     link_want = 0;

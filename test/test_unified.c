@@ -665,6 +665,15 @@ static void test_adv_payload(void)
     ok(adv[9] == 0x42 && adv[10] == 0x03, "capabilities, extension bit set");
     ok((uint16_t)(adv[9] | (adv[10] << 8)) & OEPL_CAP_ADV_EXTENDED,
        "and an access point can see it");
+    /* The numbers an access point tests these against are its own, so they
+     * are checked against the literals rather than against themselves.
+     */
+    ok(OEPL_CAP_NFC == 0x0040u, "the NFC bit is the protocol's 0x40");
+    ok(OEPL_CAP_NFC_WAKE == 0x0080u, "and the NFC wake bit its 0x80");
+    ok((OEPL_CAP_NFC | OEPL_CAP_NFC_WAKE) == 0x00C0u,
+       "a board with the chip watched reports both");
+    ok(!((OEPL_CAP_NFC | OEPL_CAP_NFC_WAKE) & OEPL_CAP_ADV_EXTENDED),
+       "and neither of them is the extension bit");
     ok(adv[11] == (uint8_t)(3250u & 0xFF) && adv[12] == (uint8_t)(3250u >> 8), "battery");
     ok((int8_t)adv[13] == 25, "temperature");
     ok(adv[14] == 7, "counter");

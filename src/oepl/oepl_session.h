@@ -316,6 +316,11 @@ OEPL_API uint16_t oepl_frame_get(const uint8_t src[2]);
 #define OEPL_CAP_LED          0x0001u
 #define OEPL_CAP_COMPRESSION  0x0002u
 #define OEPL_CAP_NFC          0x0040u
+/* The chip's IRQ line is watched, so a reader at the glass is reported
+ * rather than only served. Set with OEPL_CAP_NFC, which is how the
+ * reference firmware states the pair as well.
+ */
+#define OEPL_CAP_NFC_WAKE     0x0080u
 #define OEPL_CAP_IS_BLE       0x0100u
 /* Says the two extra fields below are on the air. An access point that does
  * not know them ignores both; one that does checks this bit first.
