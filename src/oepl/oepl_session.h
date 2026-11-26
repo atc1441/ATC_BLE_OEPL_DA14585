@@ -44,18 +44,15 @@
  * would have printed on a probe arrives as OEPL_CMD_ACK_LOG.
  */
 #define OEPL_CMD_LOG        0x0022u
-/* This build's own extension, not part of the reference command set: pick the
- * sleep mode at runtime. 0 is ARCH_SLEEP_OFF, 1 is extended sleep.
- *
- * It is a command rather than a build option on purpose. Extended sleep is
- * where the current actually goes - the difference is better than tenfold -
- * but it is also the one setting that can leave this chip waking into
- * something it cannot run, and a tag that does that is only recoverable with
- * a programmer. Held in RAM and defaulting to off, so the escape hatch is a
- * power cycle rather than a J-Link, and nothing can be stored that stops the
- * tag coming back.
+/* What the panel is showing, in full: the tag answers with OEPL_CMD_ACK_IMG_VER,
+ * the eight-byte dataVer of the drawn image, its CRC-16 and a slot byte. The
+ * advertisement carries only the CRC-16 of the same version (see
+ * oepl_adv_payload); this is its companion over a connection, where there is
+ * room for all 64 bits so a host can compare exactly. No payload in the
+ * request. The id and the reply layout are the reference firmware's
+ * BLE_CMD_GET_IMG_VER / BLE_CMD_ACK_IMG_VER.
  */
-#define OEPL_CMD_SLEEP      0x0023u
+#define OEPL_CMD_GET_IMG_VER 0x0023u
 #define OEPL_CMD_ACK_CMD    0x0063u
 #define OEPL_CMD_AVAIL      0x0064u
 #define OEPL_CMD_BLOCK_PART 0x0065u
@@ -76,6 +73,10 @@
 #define OEPL_CMD_ACK_SYS    0x00D5u
 /* Streamed log text. The payload is the bytes themselves, no header. */
 #define OEPL_CMD_ACK_LOG    0x00D6u
+/* Answer to OEPL_CMD_GET_IMG_VER: eight bytes of dataVer (little end first),
+ * its CRC-16/CCITT-FALSE, then a slot byte (0xFF when nothing is shown).
+ */
+#define OEPL_CMD_ACK_IMG_VER 0x00D7u
 #define OEPL_CMD_ERR        0xFFFFu
 
 /* The PIN, and why it is only ever in RAM.

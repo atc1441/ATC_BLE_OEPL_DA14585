@@ -359,7 +359,7 @@ implemented answers `0xFFFF`**, which is a normal answer and not a fault.
 | `0x0020` | Protection | `0x00D4` + 6 B | PIN state and both timeouts |
 | `0x0021` | Sysinfo | `0x00D5` + 116 B | The whole readout |
 | `0x0022` | Log stream | `0x0063` | `01` starts, `00` stops; text arrives as `0x00D6` |
-| `0x0023` | Sleep on / off | `0x0063` | Runtime switch, from RAM; a power cycle undoes it |
+| `0x0023` | Image shown | `0x00D7` + 11 B | The drawn `dataVer` (8 B), its CRC-16, a slot byte |
 | `0x0064` | AvailDataInfo | `0x00C6` | Starts a picture, firmware or NDEF transfer |
 | `0x0065` | Block part | `0x00C5` | One part of the current block |
 
@@ -367,8 +367,18 @@ implemented answers `0xFFFF`**, which is a normal answer and not a fault.
 point stops asking, and then ignored, because nothing on this board can wake the
 chip out of a deep sleep: the reset pin cannot restart a DA14585, so a tag that
 took the command came back only by losing power - which on a sealed label means
-opening it. `0x0017` reboots, and `0x0023` switches the sleep mode the tag uses
-while it runs.
+opening it. `0x0017` reboots. The tag always runs the low-power extended sleep
+between advertisements (on by default, see the feature table); there is no runtime
+switch for it, so nothing a host sends can leave a tag drawing the idle current.
+
+**`0x0023` reports what is on the glass.** It answers `0x00D7` with the eight-byte
+`dataVer` of the drawn image (little end first), its CRC-16/CCITT-FALSE and a slot
+byte — `0xFF` when the glass is on its own status screen, where the version is zero
+and the CRC is `0x313E`. It is the connection-side companion of the CRC-16 the tag
+puts in its advertisement: the advertisement is a 16-bit hint a passive scan can
+read, this is the full 64 bits so a host can tell exactly whether the tag already
+holds the image it is about to send. Information only — it never refuses and never
+blocks an upload.
 
 ### Transfers
 

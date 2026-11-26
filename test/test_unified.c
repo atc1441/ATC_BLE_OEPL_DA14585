@@ -709,6 +709,51 @@ static void test_adv_payload(void)
     ok(16 <= 31, "the scan response fits");
 }
 
+/* The 0x0023 (GET_IMG_VER) reply layout the web uploader and the reference
+ * firmware expect: opcode 0x00D7, then dataVer little end first, its CRC-16,
+ * and a slot byte. Built the way user_atc.c builds it.
+ */
+static void build_img_ver(uint8_t d[13], uint64_t ver)
+{
+    uint16_t crc = oepl_image_crc(ver);
+    int i;
+
+    oepl_frame_put(d, OEPL_CMD_ACK_IMG_VER);
+    for (i = 0; i < 8; i++) d[2 + i] = (uint8_t)(ver >> (8 * i));
+    d[10] = (uint8_t)(crc & 0xFF);
+    d[11] = (uint8_t)(crc >> 8);
+    d[12] = (ver != 0u) ? 0u : 0xFFu;
+}
+
+static void test_img_ver_reply(void)
+{
+    uint8_t d[13];
+
+    ok(OEPL_CMD_GET_IMG_VER == 0x0023u, "get-image-version is 0x0023");
+    ok(OEPL_CMD_ACK_IMG_VER == 0x00D7u, "its answer is 0x00D7");
+
+    /* Nothing shown: version zero, CRC of eight zero bytes, no slot. */
+    build_img_ver(d, 0);
+    ok(d[0] == 0x00 && d[1] == 0xD7, "opcode 00 D7, big end first on the wire");
+    ok(d[2] == 0 && d[9] == 0, "a zero version is all zero bytes");
+    ok(d[10] == 0x3E && d[11] == 0x31, "its CRC is 0x313E, little end first");
+    ok(d[12] == 0xFF, "and no slot");
+
+    /* A real version: little-endian on the wire, CRC beside it, slot 0. */
+    build_img_ver(d, 0x1122334455667788ull);
+    ok(d[2] == 0x88 && d[3] == 0x77 && d[9] == 0x11, "version little end first");
+    {
+        uint8_t v[8];
+        uint16_t crc;
+        int i;
+        for (i = 0; i < 8; i++) v[i] = d[2 + i];
+        crc = oepl_crc16_ccitt(v, 8);
+        ok(d[10] == (uint8_t)(crc & 0xFF) && d[11] == (uint8_t)(crc >> 8),
+           "the CRC is of the eight version bytes");
+    }
+    ok(d[12] == 0x00, "a shown image reports slot 0");
+}
+
 int main(void)
 {
     test_pin_basics();
@@ -724,6 +769,7 @@ int main(void)
     test_panel_catalog();
     test_panel_limits();
     test_adv_payload();
+    test_img_ver_reply();
 
     if (failures != 0) {
         printf("FAILED %d of %d checks\n", failures, checks);

@@ -117,7 +117,7 @@ static uint16_t atc_capabilities(void)
 /* Little-endian on the air: bytes 0x31, 0x00. Decimal 49. The access point
  * turns on zlib images once a tag reports a version of 0x27 or higher.
  */
-#define ATC_FW_VERSION    0x003Au
+#define ATC_FW_VERSION    0x003Bu
 
 extern struct bd_addr dev_bdaddr;
 
@@ -212,8 +212,6 @@ static timer_hnd power_timer = EASY_TIMER_INVALID_TIMER;
 /* Acknowledged and then ignored. See the handler. */
 #define ATC_CMD_DEEP   0x0014u
 #define ATC_CMD_REBOOT 0x0017u
-/* This build's own, see OEPL_CMD_SLEEP: 0 off, 1 extended sleep. RAM only. */
-#define ATC_CMD_SLEEP  0x0023u
 #define ATC_ADV_SLOTS_MIN 100u
 #define ATC_ADV_SLOTS_MAX 10000u
 #define ATC_ADV_SLOTS_DEF 3200u
@@ -283,7 +281,6 @@ static timer_hnd power_timer = EASY_TIMER_INVALID_TIMER;
 static uint16_t timer_fails;
 static uint16_t block_bad_said;
 static uint16_t sense_countdown;   /* seconds until the next sensor pass */
-static uint8_t sleep_mode_on;
 static uint16_t sleep_woke;
 static uint16_t sleep_woke_said;
 
@@ -2560,35 +2557,33 @@ static void on_write(const struct custs1_val_write_ind *ind)
         notify_reply(reply, 2);
         return;
     }
-    /* Pick the sleep mode. This build's own command - see OEPL_CMD_SLEEP.
+    /* What the panel is showing, in full.
      *
-     * ARCH_SLEEP_OFF leaves this chip in active mode for ever, which is where
-     * the idle current goes: measured 700 uA with nothing happening. Extended
-     * sleep is the fix, and the only reason it is not simply compiled in is
-     * that a wake this firmware cannot survive would need a programmer to
-     * undo. So it is switched here, kept in RAM, and off after every boot.
+     * The companion of the CRC-16 in the advertisement (oepl_adv_payload): over
+     * a connection there is room for all 64 bits of the dataVer, so a host can
+     * tell exactly whether the tag already has the image it is about to send.
+     * The reply is OEPL_CMD_ACK_IMG_VER - eight bytes of dataVer little end
+     * first, its CRC-16, and a slot byte - the layout the reference firmware
+     * and the web uploader expect. This board keeps its picture in one window,
+     * not numbered slots, so the slot is 0 when something is shown and 0xFF
+     * when nothing is.
+     *
+     * Information only: it never refuses, and it is answered even mid-session
+     * so a host can read it whenever it likes. shown_ver is 0 and its CRC is
+     * 0x313E (the CRC of eight zero bytes) whenever the glass is on its own
+     * status screen - the same value the advertisement reports then.
      */
-    if (cmd == ATC_CMD_SLEEP) {
-        uint8_t want = (ind->length >= 3u) ? ind->value[2] : 0u;
+    if (cmd == OEPL_CMD_GET_IMG_VER) {
+        uint64_t ver = atc_session.shown_ver;
+        uint16_t crc = oepl_image_crc(ver);
+        uint8_t d[13];
 
-        if (refresh_active || refresh_pending || ota_busy || atc_session.active) {
-            oepl_frame_put(reply, OEPL_CMD_ERR);
-            notify_reply(reply, 2);
-            return;
-        }
-        if (want > 1u) {
-            oepl_frame_put(reply, OEPL_CMD_ERR);
-            notify_reply(reply, 2);
-            return;
-        }
-        /* Answer first. If the very next thing the chip does is fail to wake,
-         * at least the host knows what it asked for.
-         */
-        oepl_frame_put(reply, OEPL_CMD_ACK_CMD);
-        notify_reply(reply, 2);
-        sleep_mode_on = want;
-        rtt_puts(want ? "sleep extended\n" : "sleep off\n");
-        arch_set_sleep_mode(want ? ARCH_EXT_SLEEP_ON : ARCH_SLEEP_OFF);
+        oepl_frame_put(d, OEPL_CMD_ACK_IMG_VER);
+        write_u64(d + 2, ver);
+        d[10] = (uint8_t)(crc & 0xFFu);
+        d[11] = (uint8_t)(crc >> 8);
+        d[12] = (ver != 0u) ? 0u : 0xFFu;
+        notify_reply(d, 13);
         return;
     }
     if (cmd == ATC_CMD_LED) {
