@@ -10,3 +10,4 @@
 
 # The SDK is committed exactly as Renesas shipped it: no line-ending work.
 /sdk/** -text
+*.jpg binary

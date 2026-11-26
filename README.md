@@ -8,6 +8,15 @@ bytes, locks the tag with a PIN, changes the panel type or the BLE address, and 
 the tag's own log live. Everything needed to build it is in this repository,
 including the SDK.
 
+![Three tags running this firmware](docs/displays.jpg)
+
+Three boards on this firmware. On the left the **7.5″** (880 × 528) showing a date,
+the **black/white/red** glass used for the big red `25`. Top right the **11.6″**
+(960 × 640, config `3`, hardware type `0x72`) on its own boot screen — the advertised
+name `ATC_897970`, the tag address `A0:A3:B8:89:79:70`, `ID 0072 960x640`, battery and
+temperature. Bottom the **13.3″** (960 × 680) showing a transferred photo. All three
+are the same binary; the config byte picks the glass.
+
 | | |
 | --- | --- |
 | Target | Renesas DA14585, image runs from SysRAM, loaded from SPI flash by the ROM bootloader |
@@ -57,6 +66,16 @@ power cycle for this: `0x0017` reboots it, which opens the same window.
 **Do it while the glass is idle.** The tool halts the core and loads a small flasher
 into RAM. A refresh, a picture erase or a firmware copy that is still running will be
 cut off and the glass can be left half drawn.
+
+<img src="docs/pcb-swd.jpg" alt="The DA14585 PCB with the SWD pads" width="380">
+
+
+**Getting to the pads is the hard part.** Opening a label far enough to reach the PCB
+is usually fiddly — the glass is bonded to the housing and the board sits behind it —
+but once it is open the board makes the rest easy: the SWD pads are **silk-screened
+right on it**, `RST`, `CLK` (SWCLK) and `DIO` (SWDIO), next to the 16 MHz crystal and
+the DA14585. Tack three wires to those three pads (and share ground with the probe)
+and the tag is flashable; nothing else needs tracing.
 
 It touches **only** the application bank, `0x0001F000`…`0x00038000`. The bootloader,
 the stock image, the pin record, the waveform, the NDEF sector, the settings record
@@ -175,6 +194,7 @@ same connector, the RGB LED fitted or not, an NFC chip or not. One row in
 | `0` | — | — | — | — | — | **unconfigured**, where a freshly flashed tag starts. Advertises hardware type `0xFA`, which an access point reads as config mode |
 | `1` | ZKC75S, 7.5″ | 880 × 528 | black / white / red | yes | no | hardware type `0x73`. **Verified on hardware** |
 | `2` | ZKC133V-N, 13.3″ | 960 × 680 | black / white / red | no | yes | hardware type `0x74`. **Verified on hardware** |
+| `3` | ZKC116V-N, 11.6″ | 960 × 640 | black / white / red | no | yes | hardware type `0x72`. **Verified on hardware** |
 
 The id is big-endian in command `0x0004`:
 
@@ -225,8 +245,9 @@ A glass on the same controller is one more row:
 static const atc_panel catalog[] = {
     /* id   hw       w     h    col driver          caps                       boost  name */
     {   0u, 0x00FAu,   0u,   0u, 0u, ATC_DRV_NONE,   0u,                        0x00u, "unconfigured"       },
-    {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED | ATC_CAP_NFC, 0x40u, "7.5 BWR ZKC75S"     },
+    {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED,               0x40u, "7.5 BWR ZKC75S"     },
     {   2u, 0x0074u, 960u, 680u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "13.3 BWR ZKC133V-N" },
+    {   3u, 0x0072u, 960u, 640u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "11.6 BWR ZKC116V-N" },
 };
 ```
 

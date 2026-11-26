@@ -29,7 +29,7 @@ static const atc_panel catalog[] = {
     {   0u, 0x00FAu,   0u,   0u, 0u, ATC_DRV_NONE,   0u,                        0x00u, "unconfigured"       },
     {   1u, 0x0073u, 880u, 528u, 2u, ATC_DRV_ZKC75S, ATC_CAP_LED,               0x40u, "7.5 BWR ZKC75S"     },
     {   2u, 0x0074u, 960u, 680u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "13.3 BWR ZKC133V-N" },
-    {   3u, 0x0072u, 960u, 640u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "11.6 BWR ZKC"       },
+    {   3u, 0x0072u, 960u, 640u, 2u, ATC_DRV_ZKC75S, ATC_CAP_NFC,               0x80u, "11.6 BWR ZKC116V-N" },
 };
 
 /* Row 2, the 13.3 inch board, read off its own stock firmware:
@@ -60,6 +60,9 @@ static const atc_panel catalog[] = {
  *     then a 0x07FC.. pointer); the 13.3 inch board has 960 by 680 at the
  *     same offset. 960 wide, so it fits this driver's 1024-pixel row and the
  *     same picture window the 13.3 inch glass uses.
+ *   - The board calls itself ZKC116V-N in the record at 0x39014 of its flash,
+ *     the same place the 13.3 inch board has ZKC133V-N and the 7.5 inch board
+ *     ZKC75S.
  *   - Same ZKC / SSD1677 controller and the same init this driver sends. The
  *     firmware carries both booster sequences - 0xAE 0xC7 0xC3 0xC0 then 0x40,
  *     and the same then 0x80 - and the 960-wide glass takes the 0x80 one, as
